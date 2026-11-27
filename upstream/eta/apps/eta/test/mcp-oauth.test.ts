@@ -1,0 +1,449 @@
+/**
+ * MCP OAuth on the host, end to end against a fake authorization server: `login` on the `mcp`
+ * target, the browser's return to `/mcp/oauth/callback` (which needs no token, while nothing else
+ * gets through without one), the sealed tokens, the server connecting with them, and a session's
+ * `import "mcp:<server>"` calling its tool.
+ */
+import type { McpServerView } from "@eta/client-contracts";
+import type { McpTuning } from "../src/product";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { mcpServerKey } from "@eta/daemon";
+import { describe, expect, it } from "vitest";
+import {
+  createFakeAuthServer,
+  MCP_URL,
+} from "../../../packages/eta-mcp/test/oauth/fake-auth-server";
+import { CredentialRows } from "../src/mcp/credentials";
+import { loadSecretKey } from "../src/secret";
+import { connect, until } from "./support/client";
+import { tempDir, testHost } from "./support/host";
+
+const TOKEN = "correct-horse-battery-staple";
+const ORIGIN = "https://eta.test";
+type FetchLike = NonNullable<McpTuning["fetch"]>;
+
+/**
+ * The fake authorization server, with an MCP endpoint that answers a request carrying a token it
+ * issued (`access-<n>`): JSON-RPC over streamable HTTP, one tool `whoami`. Without one it is the
+ * fake's 401, which is what sends a client to sign in.
+ */
+function withMcpEndpoint(
+  auth: ReturnType<typeof createFakeAuthServer>,
+): FetchLike {
+  return async (input, init) => {
+    const bearer = new Headers(init?.headers).get("authorization");
+    if (String(input) !== MCP_URL || !bearer?.startsWith("Bearer access-"))
+      return await auth.fetch(input, init);
+    if ((init?.method ?? "GET") !== "POST")
+      return new Response(null, { status: 405 });
+    const message = JSON.parse(String(init?.body)) as {
+      id?: number;
+      method: string;
+      params?: Record<string, unknown>;
+    };
+    if (message.id === undefined) return new Response(null, { status: 202 });
+    const result =
+      message.method === "initialize"
+        ? {
+            protocolVersion: message.params?.protocolVersion,
+            capabilities: { tools: {} },
+            serverInfo: { name: "remote", version: "1.0.0" },
+          }
+        : message.method === "tools/list"
+          ? {
+              tools: [
+                {
+                  name: "whoami",
+                  description: "Say who the token belongs to.",
+                  inputSchema: { type: "object", properties: {} },
+                },
+              ],
+            }
+          : message.method === "tools/call"
+            ? {
+                content: [{ type: "text", text: "ada" }],
+                structuredContent: { token: bearer.slice("Bearer ".length) },
+              }
+            : {};
+    return new Response(
+      JSON.stringify({ jsonrpc: "2.0", id: message.id, result }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      },
+    );
+  };
+}
+
+async function setUp(options: { publicUrl?: string } = {}) {
+  const dataDir = await tempDir();
+  await mkdir(join(dataDir, ".eta"), { recursive: true });
+  await writeFile(
+    join(dataDir, ".eta", "mcp.json"),
+    JSON.stringify({
+      // `approveTools` is still read, and no longer asks anything.
+      mcpServers: {
+        remote: { url: MCP_URL, auth: "oauth", approveTools: true },
+      },
+    }),
+  );
+  const tokenFile = join(await tempDir("eta-token-"), "token");
+  await writeFile(tokenFile, `${TOKEN}\n`, { mode: 0o600 });
+  const auth = createFakeAuthServer();
+  const host = await testHost({
+    dataDir,
+    tokenFile,
+    ...(options.publicUrl === undefined
+      ? {}
+      : { publicUrl: options.publicUrl }),
+    mcp: {
+      fetch: withMcpEndpoint(auth),
+      manager: { resolvers: false, checkIntervalMs: 0 },
+    },
+  });
+  const client = await connect(`ws://127.0.0.1:${host.port}/ws`, {
+    authorization: `Bearer ${TOKEN}`,
+  });
+  await client.hello();
+  client.subscribe("mcp");
+  const created = (await client.call("agents", "create", {
+    name: "Ada",
+    model: "fake:fake-model",
+  })) as {
+    agent: { id: string };
+  };
+  const agentId = created.agent.id;
+  const views = () => client.section<McpServerView[]>("mcp", "list") ?? [];
+  const remote = () =>
+    views().find(
+      (view) => view.agentId === agentId && view.server === "remote",
+    );
+  await until(() => remote() !== undefined);
+  const login = async (redirectOrigin: string | null = ORIGIN) =>
+    (await client.call("mcp", "login", {
+      agentId,
+      server: "remote",
+      ...(redirectOrigin === null ? {} : { redirectOrigin }),
+    })) as { pendingId: string; authorizationUrl: string };
+  const base = `http://127.0.0.1:${host.port}`;
+  const callback = (query: string, init: RequestInit = {}) =>
+    fetch(`${base}/mcp/oauth/callback${query}`, init);
+  const store = new CredentialRows(host.db, loadSecretKey(dataDir));
+  return { host, client, auth, agentId, remote, login, base, callback, store };
+}
+
+const KEY = mcpServerKey(MCP_URL);
+
+describe("signing in to an OAuth MCP server", () => {
+  it("lists the server as needing a login before anyone signs in", async () => {
+    const s = await setUp();
+    expect(s.remote()).toMatchObject({
+      agentName: "Ada",
+      source: "~/.eta/mcp.json",
+      transport: "http",
+      lifecycle: "lazy",
+      state: "not-connected",
+      toolCount: 0,
+      error: null,
+      auth: "needs_login",
+    });
+  });
+
+  it("goes from login to a session's import calling the tool", async () => {
+    const s = await setUp();
+    const { pendingId, authorizationUrl } = await s.login();
+    expect(new URL(authorizationUrl).searchParams.get("state")).toBe(pendingId);
+    expect(new URL(authorizationUrl).searchParams.get("redirect_uri")).toBe(
+      `${ORIGIN}/mcp/oauth/callback`,
+    );
+
+    // The browser comes back from the provider with no cookie and no bearer.
+    const redirect = new URL(s.auth.approve(authorizationUrl));
+    const response = await s.callback(redirect.search);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("close this tab");
+    expect(s.store.has(KEY, "tokens")).toBe(true);
+
+    // Signing in connects the servers that were waiting for it.
+    await until(() => s.remote()?.state === "connected", 10_000);
+    expect(s.remote()).toMatchObject({
+      auth: "signed_in",
+      toolCount: 1,
+      error: null,
+    });
+
+    // A session reaches the server with the stored token, and nothing asks for approval.
+    const cwd = await tempDir("eta-mcp-project-");
+    const { session } = await s.host.server.sessions.create({ cwd });
+    const result = await session.esm!.agent.run(`
+      import { whoami } from "mcp:remote";
+      export default await whoami({});
+    `);
+    expect(result.value).toEqual({ token: expect.stringMatching(/^access-/) });
+    expect(result.effects.map((effect) => effect.name)).toContain(
+      "mcp.remote.whoami",
+    );
+
+    // The code is single use.
+    expect((await s.callback(redirect.search)).status).toBe(400);
+  }, 30_000);
+
+  it("ignores a state it did not issue and keeps the real login waiting", async () => {
+    const s = await setUp();
+    const { authorizationUrl } = await s.login();
+    const redirect = new URL(s.auth.approve(authorizationUrl));
+    for (const query of [
+      `?code=${redirect.searchParams.get("code")}&state=not-the-state`,
+      `?code=${redirect.searchParams.get("code")}`,
+      "",
+    ]) {
+      const response = await s.callback(query);
+      expect(response.status).toBe(400);
+      expect(await response.text()).toContain("Sign-in not found");
+    }
+    expect(s.store.has(KEY, "tokens")).toBe(false);
+    expect((await s.callback(redirect.search)).status).toBe(200);
+    await until(() => s.remote()?.auth === "signed_in");
+  });
+
+  it("lets nothing else past the token gate", async () => {
+    const s = await setUp();
+    const { authorizationUrl } = await s.login();
+    const redirect = new URL(s.auth.approve(authorizationUrl));
+    for (const path of ["/mcp/oauth/callback/more", "/mcp/oauth", "/mcp", "/"])
+      expect((await fetch(`${s.base}${path}${redirect.search}`)).status).toBe(
+        401,
+      );
+    for (const method of ["POST", "DELETE"])
+      expect((await s.callback(redirect.search, { method })).status).toBe(401);
+    expect(s.store.has(KEY, "tokens")).toBe(false);
+  });
+
+  it("returns to the configured public address, whatever the client says", async () => {
+    const s = await setUp({ publicUrl: "https://public.example.com/ignored" });
+    const { authorizationUrl } = await s.login("https://elsewhere.test");
+    expect(new URL(authorizationUrl).searchParams.get("redirect_uri")).toBe(
+      "https://public.example.com/mcp/oauth/callback",
+    );
+  });
+
+  it("refuses with no address to return to, and for a server it does not have", async () => {
+    const s = await setUp();
+    await expect(s.login(null)).rejects.toThrow(/--public-url/);
+    await expect(
+      s.client.call("mcp", "login", {
+        agentId: s.agentId,
+        server: "nope",
+        redirectOrigin: ORIGIN,
+      }),
+    ).rejects.toThrow(/no MCP server/);
+  });
+
+  it("completes from a pasted redirect URL, and signs out again", async () => {
+    const s = await setUp();
+    const { pendingId, authorizationUrl } = await s.login();
+    const redirect = s.auth.approve(authorizationUrl);
+    const forged = new URL(redirect);
+    forged.searchParams.set("state", "forged");
+    await expect(
+      s.client.call("mcp", "completeLogin", {
+        pendingId,
+        callbackUrl: forged.href,
+      }),
+    ).rejects.toThrow(/state/i);
+    await s.client.call("mcp", "completeLogin", {
+      pendingId,
+      callbackUrl: redirect,
+    });
+    await until(() => s.remote()?.auth === "signed_in");
+
+    await s.client.call("mcp", "logout", {
+      agentId: s.agentId,
+      server: "remote",
+    });
+    await until(() => s.remote()?.auth === "needs_login");
+    expect(s.store.has(KEY, "tokens")).toBe(false);
+  });
+});
+
+describe("a plugin's remote server", () => {
+  /**
+   * A host with a plugin whose `mcp.json` names the fake's endpoint and nothing about auth; its
+   * extension and the user's `~/.eta/mcp.json` are what a test gives.
+   */
+  async function withPlugin(
+    options: { extension?: unknown; userServers?: unknown } = {},
+  ) {
+    const dataDir = await tempDir();
+    const root = join(dataDir, "plugins", "remote-plugin");
+    await mkdir(root, { recursive: true });
+    await writeFile(
+      join(root, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "remote-plugin",
+        ...(options.extension === undefined
+          ? {}
+          : { extensions: { "tech.0xfe.eta": options.extension } }),
+      }),
+    );
+    if (options.userServers !== undefined) {
+      await mkdir(join(dataDir, ".eta"), { recursive: true });
+      await writeFile(
+        join(dataDir, ".eta", "mcp.json"),
+        JSON.stringify({ mcpServers: options.userServers }),
+      );
+    }
+    await writeFile(
+      join(root, "mcp.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+        mcpServers: { remote: { type: "streamable-http", url: MCP_URL } },
+      }),
+    );
+    const tokenFile = join(await tempDir("eta-token-"), "token");
+    await writeFile(tokenFile, `${TOKEN}\n`, { mode: 0o600 });
+    const auth = createFakeAuthServer();
+    const host = await testHost({
+      dataDir,
+      tokenFile,
+      mcp: {
+        fetch: withMcpEndpoint(auth),
+        manager: { resolvers: false, checkIntervalMs: 0 },
+      },
+    });
+    const client = await connect(`ws://127.0.0.1:${host.port}/ws`, {
+      authorization: `Bearer ${TOKEN}`,
+    });
+    await client.hello();
+    client.subscribe("mcp");
+    client.subscribe("plugins");
+    const { agent } = (await client.call("agents", "create", {
+      name: "Designer",
+      model: "fake:fake-model",
+    })) as { agent: { id: string } };
+    await until(() =>
+      (
+        client.section<{ name: string; state: string }[]>("plugins", "list") ??
+        []
+      ).some((plugin) => plugin.name === "remote-plugin"),
+    );
+    await client.call("agents", "update", {
+      agentId: agent.id,
+      plugins: ["remote-plugin"],
+    });
+    const views = () =>
+      (client.section<McpServerView[]>("mcp", "list") ?? []).filter(
+        (view) =>
+          view.agentId === agent.id && view.server === "remote-plugin-remote",
+      );
+    const remote = () => views()[0];
+    return { host, client, auth, agentId: agent.id, remote, views };
+  }
+
+  it("is listed under the plugin, asks for a login only once the server does, and is called after it", async () => {
+    const s = await withPlugin();
+    await until(() => s.remote() !== undefined);
+    // OAuth by default, but no button before the server has said it wants one.
+    expect(s.remote()).toMatchObject({
+      source: "plugin:remote-plugin",
+      transport: "http",
+      state: "not-connected",
+      auth: "none",
+    });
+
+    const tried = (await s.client.call("mcp", "connect", {
+      agentId: s.agentId,
+      server: "remote-plugin-remote",
+    })) as { ok: boolean };
+    expect(tried.ok).toBe(false);
+    await until(() => s.remote()?.auth === "needs_login");
+    expect(s.remote()?.state).toBe("needs-auth");
+
+    const { authorizationUrl } = (await s.client.call("mcp", "login", {
+      agentId: s.agentId,
+      server: "remote-plugin-remote",
+      redirectOrigin: ORIGIN,
+    })) as { authorizationUrl: string };
+    const redirect = new URL(s.auth.approve(authorizationUrl));
+    const response = await fetch(
+      `http://127.0.0.1:${s.host.port}/mcp/oauth/callback${redirect.search}`,
+    );
+    expect(response.status).toBe(200);
+    await until(() => s.remote()?.state === "connected", 10_000);
+    expect(s.remote()).toMatchObject({ auth: "signed_in", toolCount: 1 });
+
+    const cwd = await tempDir("eta-mcp-project-");
+    const { session } = await s.host.server.sessions.create({
+      cwd,
+      agentId: s.agentId,
+    });
+    const result = await session.esm!.agent.run(`
+      import { whoami } from "mcp:remote-plugin-remote";
+      export default await whoami({});
+    `);
+    expect(result.value).toEqual({ token: expect.stringMatching(/^access-/) });
+  }, 30_000);
+
+  it("declared auth: false, fails on a 401 with no sign-in, and stays failed", async () => {
+    const s = await withPlugin({
+      extension: { mcp: { remote: { auth: false } } },
+    });
+    await until(() => s.remote() !== undefined);
+    expect(s.remote()).toMatchObject({
+      source: "plugin:remote-plugin",
+      state: "not-connected",
+      auth: "none",
+    });
+    const tried = (await s.client.call("mcp", "connect", {
+      agentId: s.agentId,
+      server: "remote-plugin-remote",
+    })) as { ok: boolean; message: string | null };
+    expect(tried.ok).toBe(false);
+    expect(tried.message).toContain("HTTP 401");
+    await until(() => s.remote()?.state === "failed");
+    expect(s.remote()).toMatchObject({ auth: "none" });
+    expect(s.remote()?.error).toContain("auth: false");
+    // A refreshed list, and another attempt, are still a failure and never a sign-in.
+    await s.client.call("mcp", "reconnect", {
+      agentId: s.agentId,
+      server: "remote-plugin-remote",
+    });
+    await until(() => s.remote()?.state === "failed");
+    expect(s.remote()).toMatchObject({ auth: "none" });
+    await expect(
+      s.client.call("mcp", "login", {
+        agentId: s.agentId,
+        server: "remote-plugin-remote",
+        redirectOrigin: ORIGIN,
+      }),
+    ).rejects.toThrow(/does not sign in with OAuth/);
+    expect(s.auth.registrations()).toBe(0);
+  }, 30_000);
+
+  it("is listed under its plugin as overridden when the user's file declares it again", async () => {
+    const s = await withPlugin({
+      userServers: {
+        "remote-plugin-remote": { url: "https://user.example.com/mcp" },
+      },
+    });
+    await until(() => s.views().length === 2);
+    const bySource = (source: string) =>
+      s.views().find((view) => view.source === source);
+    expect(bySource("plugin:remote-plugin")).toMatchObject({
+      state: "not-connected",
+      toolCount: 0,
+      auth: "none",
+      overriddenBy: { source: "~/.eta/mcp.json", name: "remote-plugin-remote" },
+      overrides: null,
+    });
+    // Replaced whole: the plugin's implied OAuth is not the user's server's.
+    const used = bySource("~/.eta/mcp.json");
+    expect(used).toMatchObject({
+      overriddenBy: null,
+      overrides: "plugin:remote-plugin",
+    });
+    expect(used?.auth).toBe("none");
+  }, 30_000);
+});

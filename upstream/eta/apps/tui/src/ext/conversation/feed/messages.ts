@@ -1,0 +1,56 @@
+import { defineMessages } from "../../../i18n/messages";
+
+/** The lines the transcript says about the conversation rather than in it. */
+export const feedMessages = defineMessages({
+  en: {
+    joined: "Joined {names}'s reply",
+    inserted: "Inserted · {clock}",
+    replying: "Replying…",
+    unreadable: "Replying, but its session cannot be read",
+    queued: "Queued",
+    waiting: "Waiting for your answer: {question}{hint}",
+    waitingBare: "Waiting for your answer{hint}",
+    reviewHint: " ({key} to answer)",
+    stewardChanged: "{to} is now the steward, taking over from {from}.",
+    stewardSet: "{to} is now the steward.",
+    stewardCleared: "{from} is no longer the steward.",
+    stewardLeft: "{from} left the group; it has no steward now.",
+    wakeBudget:
+      "This message has used its {budget} wake-ups; later @mentions stay in the conversation and wake nobody until you write again.",
+    createdByCaptain: "Created by Captain",
+    routineReport: "Routine “{name}” sent a report: {title}",
+    routineReportUntitled: "Routine “{name}” sent a report",
+    taskDraft: "Task draft: {title}",
+    taskDraftBacklog:
+      "Task draft: {title} (goes to the backlog when confirmed; does not run yet)",
+    taskDraftDiscarded: "Task draft: {title} (discarded)",
+    taskCard: "Task #{number}: {title}",
+    taskCardBare: "Task #{number}",
+    nameSeparator: ", ",
+  },
+  zh: {
+    joined: "插进了 {names} 的回复",
+    inserted: "插入 · {clock}",
+    replying: "正在回复…",
+    unreadable: "正在回复，但读不到它的会话",
+    queued: "排队中",
+    waiting: "等你回答：{question}{hint}",
+    waitingBare: "等你回答{hint}",
+    reviewHint: "（{key} 处理）",
+    stewardChanged: "{to} 成为主理人，接替 {from}。",
+    stewardSet: "{to} 成为主理人。",
+    stewardCleared: "{from} 不再是主理人。",
+    stewardLeft: "{from} 退出了群，现在没有主理人。",
+    wakeBudget:
+      "这条消息已经用完 {budget} 次唤醒；之后的 @ 只记入对话，等你再发言才会唤醒。",
+    createdByCaptain: "由 Captain 创建",
+    routineReport: "定时任务「{name}」发来汇报：{title}",
+    routineReportUntitled: "定时任务「{name}」发来汇报",
+    taskDraft: "任务草稿：{title}",
+    taskDraftBacklog: "任务草稿：{title}（确认后放入积压，不会立即执行）",
+    taskDraftDiscarded: "任务草稿：{title}（已丢弃）",
+    taskCard: "任务 #{number}：{title}",
+    taskCardBare: "任务 #{number}",
+    nameSeparator: "、",
+  },
+});

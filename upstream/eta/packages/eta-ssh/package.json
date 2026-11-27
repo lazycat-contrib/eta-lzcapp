@@ -1,0 +1,24 @@
+{
+  "name": "@eta/ssh",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Run shell scripts on another machine over SSH, and quote for it.",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "test": "vitest --run --passWithNoTests",
+    "test:changed": "vitest --run --passWithNoTests --changed HEAD",
+    "typecheck": "bun check",
+    "lint": "eslint --cache --cache-location node_modules/.cache/eslint ."
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

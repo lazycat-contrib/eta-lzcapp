@@ -1,0 +1,64 @@
+application:
+  subdomain: eta
+  public_path: [/]
+  upstreams:
+    - location: /
+      backend: http://eta:8787/
+      fix_websocket_header: true
+
+services:
+  eta:
+    # 源码内嵌构建（上游无预构建镜像），见 lzc-build.yml images
+    image: embed:eta
+    environment:
+      - TZ=Asia/Shanghai
+      - HOME=/data
+      - ETA_PUBLIC_URL=${LAZYCAT_PUBLIC_URL}
+    # 上游镜像 ENTRYPOINT: bun apps/eta/src/main.ts --web-dir /srv/web --host 0.0.0.0 --port 8787
+    # --allow-origin 需要加上懒猫应用域名，否则浏览器 WebSocket 握手被 Origin 检查拒绝
+    command: ["--allow-origin", "https://{{ .S.AppDomain }}"]
+    binds: [/lzcapp/var/eta:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/up || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+locales:
+  zh:
+    usage: |
+      eta 是自托管的多智能体工作台：常驻 agent、自带模型账号、记忆是一个可打开的 SQLite 文件。
+
+      **首次使用**
+      1. 打开应用，从数据目录读取访问令牌完成首次登录（安装后应用详情页可查看，或使用懒猫免密登录直接进入）
+      2. 进入 设置 → Model services → Add a source：登录 ChatGPT / Grok 订阅，或粘贴任意 OpenAI 兼容 API Key
+      3. 创建你的第一个 agent，开始对话
+
+      **日常使用**
+      - 每个 agent 有独立人格、项目和记忆；长任务在会话关闭后继续运行
+      - 需要确认的操作会停下来等你批准
+      - 所有对话记录、工具调用、文件改动都在时间线上可见
+      - 记忆数据在应用数据目录 `.eta` 下，可直接打开 SQLite 文件查看
+
+      **说明**
+      - 应用完全本地运行，模型请求直连你配置的服务商，不经过任何中间方
+      - 升级：设置 → Update；升级前自动备份数据库
+en:
+  usage: |
+      eta is a self-contained multi-agent workbench: always-on agents, BYOK model accounts, memory in one SQLite file.
+
+      **First steps**
+      1. Open the app and sign in with the access token from the data directory (or use LazyCat passwordless login)
+      2. Settings → Model services → Add a source: sign in with a ChatGPT / Grok subscription or paste any OpenAI-compatible API key
+      3. Create your first agent and start talking
+
+      **Daily use**
+      - Each agent has its own persona, project, and memory; long jobs survive closed conversations
+      - Actions needing approval stop and wait for you
+      - Every turn, tool call and file change lands on a visible timeline
+      - Memory lives under `.eta` in the app data directory; open the SQLite file directly
+
+      **Notes**
+      - Everything runs locally; model requests go straight to the providers you configure
+      - Updates: Settings → Update; the database is backed up automatically first

@@ -1,0 +1,9 @@
+manifest: ./lzc-manifest.yml
+pkgout: ./
+icon: ./icon.png
+
+# 源码内嵌构建：上游不发容器镜像，从 upstream/eta 的官方 Dockerfile 构建
+images:
+  eta:
+    dockerfile: ./upstream/eta/deploy/Dockerfile
+    context: ./upstream/eta

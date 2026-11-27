@@ -1,0 +1,53 @@
+{
+  "name": "@eta/app",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The eta host: one Bun process that serves the web, the product database and the upstream WebSocket server.",
+  "license": "MIT",
+  "scripts": {
+    "//": "Not `build`: turbo would run it on every check. One file with everything inside, as a release ships it.",
+    "build:host": "bun scripts/build-host.ts",
+    "dev": "bun --watch src/main.ts --allow-origin http://127.0.0.1:${ETA_WEB_PORT:-3000}",
+    "start": "bun src/main.ts",
+    "typecheck": "bun check",
+    "lint": "eslint --cache --cache-location node_modules/.cache/eslint .",
+    "test": "bun --bun vitest --run --passWithNoTests",
+    "test:changed": "bun --bun vitest --run --passWithNoTests --changed HEAD"
+  },
+  "dependencies": {
+    "@cpajs/codex-auth": "0.1.0-rc.9",
+    "@cpajs/cpa": "0.1.0-rc.9",
+    "@earendil-works/pi-ai": "0.85.1",
+    "@eta/client-contracts": "*",
+    "@eta/client-wire-proto": "*",
+    "@eta/compaction": "*",
+    "@eta/core": "*",
+    "@eta/daemon": "*",
+    "@eta/harness": "*",
+    "@eta/mcp": "*",
+    "@eta/places": "*",
+    "@eta/releases": "*",
+    "@eta/runtime-acp": "*",
+    "@eta/runtime-oar": "*",
+    "@eta/server": "*",
+    "@eta/ssh": "*",
+    "@searxng-js/searxng": "0.1.0",
+    "@searxng-js/sex-egress": "0.2.0",
+    "@searxng-js/sex-page": "0.2.0",
+    "@searxng-js/sex-scrape": "0.2.0",
+    "@searxng-js/sex-search": "0.2.0",
+    "@searxng-js/sex-searxng": "0.2.0",
+    "croner": "10.0.1",
+    "fflate": "^0.8.3",
+    "p-limit": "7.3.3",
+    "typebox": "1.3.34"
+  },
+  "devDependencies": {
+    "@botiverse/oar": "0.136.0",
+    "@types/node": "22.19.19",
+    "bun-types": "1.4.2",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

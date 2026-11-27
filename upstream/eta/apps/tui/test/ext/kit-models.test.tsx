@@ -1,0 +1,132 @@
+/**
+ * The model list a picker shows: the configured providers' models and the gateway's, which of
+ * them can be used, in the config's order. No model is marked as a default. `useModels` is checked against a real host.
+ */
+import type {
+  LlmAccounts,
+  LlmModel,
+  ProviderSummary,
+  ProvidersView,
+} from "@eta/client-contracts";
+import type { Model } from "../../src/ext/kit/models";
+import { describe, expect, it } from "vitest";
+import { buildModels } from "../../src/ext/kit/models";
+
+function provider(
+  fields: Partial<ProviderSummary> & Pick<ProviderSummary, "id" | "kind">,
+): ProviderSummary {
+  return {
+    baseUrl: "https://example.test",
+    hasApiKey: false,
+    models: [{ id: "m1" }],
+    ...fields,
+  };
+}
+
+function view(providers: ProviderSummary[]): ProvidersView {
+  return { providers, revision: "r1" };
+}
+
+function gatewayModel(
+  fields: Partial<LlmModel> & Pick<LlmModel, "id">,
+): LlmModel {
+  return {
+    connector: "codex",
+    name: fields.id,
+    status: "available",
+    available: true,
+    ...fields,
+  };
+}
+
+const ACCOUNTS: LlmAccounts = {
+  ready: true,
+  connectors: [
+    { id: "codex", name: "Codex", flow: "oauth_device" },
+    { id: "xai", name: "Grok", flow: "oauth_device" },
+  ],
+  connections: [],
+};
+
+const ids = (models: Model[] | undefined) => models?.map((m) => m.id);
+
+describe("buildModels", () => {
+  it("is undefined until the providers' config has come", () => {
+    expect(
+      buildModels({ providers: undefined, llm: undefined, locale: "en" }),
+    ).toBeUndefined();
+    expect(
+      buildModels({
+        providers: undefined,
+        llm: { accounts: ACCOUNTS, models: [gatewayModel({ id: "g" })] },
+        locale: "en",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("lists the models in the config's order, none of them a default", () => {
+    const models = buildModels({
+      providers: view([
+        provider({ id: "a", kind: "openai-compatible" }),
+        provider({ id: "b", kind: "openai-compatible" }),
+      ]),
+      llm: undefined,
+      locale: "en",
+    });
+    expect(ids(models)).toEqual(["a:m1", "b:m1"]);
+    expect(models?.some((model) => "default" in model)).toBe(false);
+  });
+
+  it("appends the gateway's models as llm:<id> under their connector's name", () => {
+    const models = buildModels({
+      providers: view([provider({ id: "a", kind: "openai-compatible" })]),
+      llm: {
+        accounts: ACCOUNTS,
+        models: [
+          gatewayModel({ id: "gpt-5", name: "GPT-5", contextWindow: 400_000 }),
+          gatewayModel({ id: "grok-4", connector: "xai" }),
+          gatewayModel({ id: "odd", connector: "unknown-connector" }),
+        ],
+      },
+      locale: "en",
+    });
+    expect(ids(models)).toEqual(["a:m1", "llm:gpt-5", "llm:grok-4", "llm:odd"]);
+    expect(models?.[1]).toMatchObject({
+      provider: "llm",
+      providerName: "Codex",
+      name: "GPT-5",
+      contextWindow: 400_000,
+      available: true,
+    });
+    expect(models?.[2]?.providerName).toBe("Grok");
+    expect(models?.[3]?.providerName).toBe("unknown-connector");
+  });
+
+  it("takes a gateway model's availability and reason from the gateway, in the user's language", () => {
+    const llm = {
+      accounts: ACCOUNTS,
+      models: [
+        gatewayModel({ id: "degraded", status: "degraded", available: true }),
+        gatewayModel({
+          id: "down",
+          status: "unavailable",
+          available: false,
+          reason: { code: "quota_exhausted", message: "diag" },
+        }),
+      ],
+    };
+    const en = buildModels({ providers: view([]), llm, locale: "en" });
+    expect(en?.map((m) => [m.id, m.available])).toEqual([
+      ["llm:degraded", true],
+      ["llm:down", false],
+    ]);
+    expect(en?.[0]?.unavailableReason).toBeUndefined();
+    expect(en?.[1]?.unavailableReason).toBe(
+      "The quota is used up. The account resumes automatically once it recovers.",
+    );
+    const zh = buildModels({ providers: view([]), llm, locale: "zh" });
+    expect(zh?.[1]?.unavailableReason).toBe(
+      "额度已用尽，恢复后会自动继续使用。",
+    );
+  });
+});

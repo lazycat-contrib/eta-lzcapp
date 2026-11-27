@@ -1,0 +1,329 @@
+/**
+ * The place for sessions that run on a daemon's machine.
+ *
+ * The engine asks a place for an agent's session and gets a handle. Here that is one call to the
+ * daemon (`machine.open`), which brings the session in line with the agent exactly as the
+ * primary does for its own: the agent's words, the model, the thinking level and the persona go
+ * with the call, because they are the primary's, and so does the list of product tools the
+ * session will have (the daemon registers proxies that call back here to run them).
+ *
+ * After that the handle is thin. A run is one long call (`machine.run`) that ends when the
+ * session is quiet, a steer and a stop are ordinary `sessions.*` calls on the daemon's pipe, and a
+ * link that dies under any of them fails them as an unknown outcome. Nothing is replayed.
+ */
+import type {
+  DaemonRunEvent,
+  PromptImage,
+  RunOutcome,
+  ToolSpec,
+} from "@eta/client-contracts";
+import type { KernelModels, KernelTool } from "@eta/core";
+import type { Settings } from "@eta/server";
+import type {
+  EnsureInput,
+  SessionHandle,
+  SessionPlace,
+  SessionSettings,
+} from "../conversations/places";
+import type { Plugins } from "../plugins/service";
+import type { SessionHooks } from "../session-hooks";
+import type { MachineHub, MachineLink } from "./hub";
+import type { SessionMirrors } from "./mirror";
+import type { MachineRecord } from "./store";
+import { LINK_LIMITS } from "@eta/client-contracts";
+import { LinkError, modelSpecOf } from "@eta/daemon";
+import { builtinPersonas } from "@eta/harness";
+import { discoverPersonas, parseModelId } from "@eta/server";
+
+/**
+ * How long a stop may take to reach a daemon and be answered. Shorter than the engine's wait for
+ * the run to end, so a link that swallows the stop is told apart from a run that ignores it.
+ */
+const STOP_TIMEOUT_MS = 4_000;
+
+export interface RemotePlaceDeps {
+  hub: MachineHub;
+  mirrors: SessionMirrors;
+  /** The model layer and the session defaults; not there until the server is up. */
+  models: () => KernelModels | undefined;
+  defaults: () => Promise<Settings>;
+  /** The product's per-session hooks; not there until the product is made. */
+  hooks: () => Required<SessionHooks> | undefined;
+  /** What an agent's sessions load; the files and values go along with the session. */
+  plugins: Plugins;
+  /** The primary's home: where the user's own persona cards are. */
+  home: string;
+  /** A `sessions.*` action on a session of a daemon, the way the browser's are sent. */
+  forward: (
+    action: string,
+    args: { session: string; [key: string]: unknown },
+  ) => Promise<unknown>;
+  warn: (message: string) => void;
+}
+
+class RemoteHandle implements SessionHandle {
+  readonly id: string;
+  readonly #link: MachineLink;
+  readonly #warn: (message: string) => void;
+  /** The link went under the run: the daemon may still be running it. */
+  readonly #cutOff: (session: string) => void;
+  readonly #activityListeners = new Set<
+    (kind: DaemonRunEvent["kind"]) => void
+  >();
+  #running = false;
+
+  constructor(
+    id: string,
+    link: MachineLink,
+    warn: (message: string) => void,
+    cutOff: (session: string) => void,
+  ) {
+    this.id = id;
+    this.#link = link;
+    this.#warn = warn;
+    this.#cutOff = cutOff;
+  }
+
+  get running(): boolean {
+    return this.#running;
+  }
+
+  async steer(text: string, images?: PromptImage[]): Promise<void> {
+    await this.#link.pipe.call("sessions", "prompt", {
+      session: this.id,
+      text,
+      mode: "steer",
+      ifRunning: true,
+      ...(images === undefined || images.length === 0 ? {} : { images }),
+    });
+  }
+
+  async model(): Promise<string | undefined> {
+    return (await this.#link.machine("config", { session: this.id })).model;
+  }
+
+  async lastSeq(): Promise<number> {
+    return (await this.#link.machine("lastSeq", { session: this.id })).seq;
+  }
+
+  async run(
+    prompt: string,
+    _keepGoing?: () => boolean,
+    images?: PromptImage[],
+  ): Promise<RunOutcome> {
+    this.#running = true;
+    const onEvent =
+      this.#activityListeners.size === 0
+        ? undefined
+        : (raw: unknown): void => {
+            const kind = (raw as Partial<DaemonRunEvent> | null)?.kind;
+            if (
+              kind !== "tool-start" &&
+              kind !== "tool-update" &&
+              kind !== "tool-end" &&
+              kind !== "message"
+            )
+              return;
+            for (const listener of [...this.#activityListeners]) {
+              try {
+                listener(kind);
+              } catch {
+                // Liveness observation must never fail the run.
+              }
+            }
+          };
+    try {
+      return await this.#link.daemon(
+        "run",
+        {
+          session: this.id,
+          text: prompt,
+          ...(images === undefined || images.length === 0 ? {} : { images }),
+          ...(onEvent === undefined ? {} : { activity: true }),
+        },
+        {
+          timeoutMs: LINK_LIMITS.runTimeoutMs,
+          ...(onEvent === undefined ? {} : { onEvent }),
+        },
+      );
+    } catch (error) {
+      if (
+        error instanceof LinkError &&
+        (error.kind === "lost" || error.kind === "timeout")
+      )
+        this.#cutOff(this.id);
+      throw error;
+    } finally {
+      this.#running = false;
+    }
+  }
+
+  abort(): void {
+    this.stop().catch((error: unknown) =>
+      this.#warn(`[eta] could not stop ${this.id}: ${String(error)}`),
+    );
+  }
+
+  async stop(): Promise<void> {
+    await this.#link.pipe.call(
+      "sessions",
+      "abort",
+      { session: this.id },
+      { timeoutMs: STOP_TIMEOUT_MS },
+    );
+  }
+
+  onActivity(listener: (kind: DaemonRunEvent["kind"]) => void): () => void {
+    this.#activityListeners.add(listener);
+    return () => void this.#activityListeners.delete(listener);
+  }
+}
+
+export class RemotePlace implements SessionPlace {
+  readonly #deps: RemotePlaceDeps;
+  /**
+   * Sessions whose run the link went under, by machine: the daemon may still be running them,
+   * and nobody here waits for what they say. They are told to stop when the machine is back.
+   */
+  readonly #cutOff = new Map<string, Set<string>>();
+
+  constructor(deps: RemotePlaceDeps) {
+    this.#deps = deps;
+    deps.hub.onReady((link) => this.#tidy(link));
+  }
+
+  /** A machine's link went down, and why. */
+  onLost(listener: (machineId: string, reason: string) => void): () => void {
+    return this.#deps.hub.onLost(listener);
+  }
+
+  /** Stop what a machine that came back may still be running for replies that already ended. */
+  #tidy(link: MachineLink): void {
+    const sessions = this.#cutOff.get(link.machineId);
+    if (sessions === undefined) return;
+    this.#cutOff.delete(link.machineId);
+    for (const session of sessions) {
+      link.pipe
+        .call("sessions", "abort", { session }, { timeoutMs: STOP_TIMEOUT_MS })
+        .catch((error: unknown) =>
+          this.#deps.warn(
+            `[eta] could not stop ${session} on ${link.machineId} after the link came back: ${String(error)}`,
+          ),
+        );
+    }
+  }
+
+  async ensure(input: EnsureInput): Promise<SessionHandle> {
+    const { hub, mirrors } = this.#deps;
+    const { machine, agent, conversation } = input;
+    const link = hub.link(machine.id);
+    if (link === undefined) {
+      throw new Error(
+        `${machine.name} is ${machine.status === "online" ? "starting" : machine.status}, so ${agent.name} cannot answer there now`,
+      );
+    }
+    // The settings name eta's own levels; an agent on an external runtime has the runtime's. The
+    // model is the agent's, or none: the engine stops an eta agent without one before this.
+    const external = agent.runtime !== "eta";
+    const defaults: Settings = external ? {} : await this.#deps.defaults();
+    const model = agent.model ?? undefined;
+    const thinkingLevel = agent.thinkingLevel ?? defaults.thinkingLevel;
+    // With no model chosen a session runs on the kernel's placeholder, which only a model layer
+    // that answers to anything (a test's) resolves; the daemon is told about it the same way.
+    const identity =
+      model === undefined
+        ? { provider: "unknown", modelId: "unknown" }
+        : parseModelId(model);
+    const known = external
+      ? undefined
+      : this.#deps.models()?.getModel(identity.provider, identity.modelId);
+    // The Composio toolkits are no files, so they are named in the open (an eta agent's are not
+    // sent: its servers come from the plugins' files).
+    const toolkits = external
+      ? this.#deps.plugins.toolkitServersFor(agent.id)
+      : [];
+    const { session } = await link.machine("open", {
+      ...(input.existing === null ? {} : { session: input.existing }),
+      cwd: input.cwd,
+      title: `${conversation.name} · ${agent.name}`,
+      agentId: agent.id,
+      conversationId: conversation.id,
+      ...(external ? { runtime: agent.runtime } : {}),
+      ...(model === undefined ? {} : { model }),
+      ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
+      ...(!external && agent.persona !== "" ? { persona: agent.persona } : {}),
+      agentPrompt: input.prompt,
+      stamp: input.stamp,
+      ...(external ? {} : { personaCards: await this.#cards() }),
+      ...(known === undefined
+        ? {}
+        : {
+            modelSpec: modelSpecOf(known, {
+              provider: identity.provider,
+              id: identity.modelId,
+            }),
+          }),
+      tools: this.#tools(conversation.id, agent.id, input.cwd),
+      plugins: await this.#deps.plugins.openOn(link, agent.id),
+      ...(toolkits.length === 0 ? {} : { mcpServers: toolkits }),
+      redactions: this.#deps.plugins.redactionsFor(agent.id),
+    });
+    if (session !== input.existing) input.created(session);
+    mirrors.register(session, machine.id);
+    return new RemoteHandle(session, link, this.#deps.warn, (cut) => {
+      const sessions = this.#cutOff.get(machine.id) ?? new Set<string>();
+      sessions.add(cut);
+      this.#cutOff.set(machine.id, sessions);
+    });
+  }
+
+  async configure(
+    sessionId: string,
+    machine: MachineRecord,
+    settings: SessionSettings,
+  ): Promise<void> {
+    if (this.#deps.hub.link(machine.id) === undefined)
+      throw new Error(`${machine.name} is ${machine.status}`);
+    if (settings.model !== undefined)
+      await this.#deps.forward("modelSet", {
+        session: sessionId,
+        model: settings.model,
+      });
+    if (settings.thinkingLevel !== undefined)
+      await this.#deps.forward("thinkingLevel", {
+        session: sessionId,
+        level: settings.thinkingLevel,
+        fallback: true,
+      });
+  }
+
+  /** What the product adds to this agent's sessions, as the daemon needs to know it. */
+  #tools(conversationId: string, agentId: string, cwd: string): ToolSpec[] {
+    const hooks = this.#deps.hooks();
+    if (hooks === undefined) return [];
+    const made = hooks.sessionTools({
+      meta: { id: "", createdAt: 0, cwd, agentId, conversationId },
+      session: undefined as never,
+    });
+    return made.map((tool: KernelTool) => ({
+      name: tool.name,
+      ...(tool.description === undefined
+        ? {}
+        : { description: tool.description }),
+      parameters: (tool as { parameters?: unknown }).parameters ?? {
+        type: "object",
+        properties: {},
+      },
+    }));
+  }
+
+  /** The persona cards the user keeps here; the built-in ones are on every machine already. */
+  async #cards() {
+    const { home, warn } = this.#deps;
+    const builtin = builtinPersonas();
+    const found = await discoverPersonas({ cwd: home, home, warn });
+    return [...found.values()]
+      .filter((card) => builtin[card.id] !== card.content)
+      .map((card) => ({ id: card.id, name: card.name, content: card.content }));
+  }
+}

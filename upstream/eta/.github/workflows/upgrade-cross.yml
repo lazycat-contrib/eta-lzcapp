@@ -1,0 +1,226 @@
+# The upgrade a person will really do: the last release, installed as a service and holding the
+# seed in test/upgrade-seed, up to this one, then back from a build that does not hold.
+#
+# release.yml calls it before publishing, on Linux only and against the draft, so a tag gets its
+# answer in minutes. The other platforms cost ten and two times as much in a private repository:
+# ask for them by hand, one at a time while something is wrong.
+name: Upgrade across versions
+
+on:
+  workflow_call:
+    inputs:
+      to:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      from:
+        description: Version to start from, like 0.2.0. Empty is the release before `to`.
+        required: false
+      to:
+        description: Version to upgrade to, like 0.2.1. Empty is the tag this runs on.
+        required: false
+      platforms:
+        description: Where to run it
+        type: choice
+        options: [linux, macos, windows, all]
+        default: linux
+
+permissions:
+  contents: read
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      from: ${{ steps.versions.outputs.from }}
+      to: ${{ steps.versions.outputs.to }}
+      matrix: ${{ steps.versions.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: test/upgrade-seed
+
+      - name: Work out what to upgrade between
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FROM: ${{ inputs.from }}
+          TO: ${{ inputs.to || github.ref_name }}
+          PLATFORMS: ${{ inputs.platforms || 'linux' }}
+        run: |
+          to=${TO#v}
+          from=${FROM#v}
+          # Every host release, and whether it is a prerelease: the desktop app's desktop-v* ones
+          # are not hosts. Non-draft only — a draft is not something anyone has installed.
+          hosts=$(mktemp)
+          gh api "repos/$GH_REPO/releases" --paginate \
+            --jq '.[] | select(.draft == false and (.tag_name | test("^v[0-9]"))) | "\(.prerelease) \(.tag_name)"' \
+            > "$hosts"
+          # The host a person upgrading *to* `to` most likely has: the highest one below it, over
+          # the versions given. Nothing when there is none.
+          below() { { cat; echo "$to"; } | sort -uV | grep -Fx -B1 -- "$to" | grep -Fxv -- "$to" || true; }
+          stable() { awk '$1 == "false" { print substr($2, 2) }' "$hosts"; }
+          any() { awk '{ print substr($2, 2) }' "$hosts"; }
+
+          extra=
+          if [[ -z $from ]]; then
+            from=$(stable | below)
+            # A prerelease is installed over the prerelease before it: people on an rc upgrade to
+            # the next rc, not through a stable, so that is the upgrade they will really do. The
+            # stable one above is still tested — one more entry on this runner, not another job.
+            # This is the rc → rc gap docs/release.md used to leave to a hand-run workflow.
+            if [[ $to == *-* ]]; then
+              extra=$(any | below)
+              [[ $extra == "$from" ]] && extra=
+            fi
+          fi
+          # A build older than the first seed has no data to be tested on: v0.1.0 cannot upgrade at all.
+          oldest=$(ls test/upgrade-seed | sort -V | head -1)
+          tooOld() { [[ $(printf '%s\n' "$1" "$oldest" | sort -V | head -1) != "$oldest" ]]; }
+          why=
+          if [[ -n $from ]] && tooOld "$from"; then
+            why="$from is older than the first seed, $oldest"
+            from=
+          fi
+          if [[ -n $extra ]] && tooOld "$extra"; then
+            extra=
+          fi
+          # The first seed cannot be the one that is too old, and nothing else may be left to test.
+          if [[ -z $from && -n $extra ]]; then
+            from=$extra
+            extra=
+          elif [[ -z $from && -z $why ]]; then
+            why="$to has no release before it"
+          fi
+          if [[ -z $from ]]; then
+            echo "::notice::$why, so there is no upgrade to test."
+            echo "$why: the upgrade was not tested." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -n $extra ]]; then
+            echo "Upgrading from $from to $to, and from $extra as well." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Upgrading from $from to $to." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          linux='{"os":"ubuntu-latest","platform":"linux-x64"}'
+          mac='{"os":"macos-latest","platform":"darwin-arm64"}'
+          windows='{"os":"windows-latest","platform":"windows-x64","exe":".exe"}'
+          case $PLATFORMS in
+            all) base="[$linux,$mac,$windows]" ;;
+            macos) base="[$mac]" ;;
+            windows) base="[$windows]" ;;
+            *) base="[$linux]" ;;
+          esac
+          # Each entry carries the version it upgrades from, so an rc's own predecessor is one more
+          # line in the same matrix (on Linux, the only platform release.yml asks for anyway).
+          matrix=$(jq -cn --argjson base "$base" --arg from "$from" --arg extra "$extra" '
+            (if $from == "" then [] else ($base | map(. + { from: $from })) end)
+            + (if $extra == "" then []
+               else ($base | map(select(.platform == "linux-x64") | . + { from: $extra })) end)')
+          {
+            echo "from=$from"
+            echo "to=$to"
+            echo "matrix={\"include\":$matrix}"
+          } >> "$GITHUB_OUTPUT"
+
+  upgrade:
+    needs: versions
+    if: needs.versions.outputs.from != ''
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.versions.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      # The draft of the release being cut can only be read with this.
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILDS: ${{ github.workspace }}/e2e-builds
+      ASSET: eta-host-${{ matrix.platform }}${{ matrix.exe }}
+      ETA_E2E_FROM: ${{ matrix.from }}
+      ETA_E2E_TO: ${{ needs.versions.outputs.to }}
+    steps:
+      # The seed is read as it is in git: Windows runners would check out CRLF.
+      - run: git config --global core.autocrlf false
+
+      # Nothing to install either: the driver runs on what Bun comes with.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            package.json
+            scripts/upgrade-e2e
+            test/upgrade-seed
+            apps/eta/src/secret.ts
+            apps/eta/src/artifacts/capability.ts
+            apps/eta/test/support/client.ts
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Fetch the two builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for version in "$ETA_E2E_FROM" "$ETA_E2E_TO"; do
+            gh release download "v$version" --pattern "$ASSET" --dir "$BUILDS/$version"
+          done
+          chmod +x "$BUILDS"/*/"$ASSET"
+
+      - name: Make a build that does not hold
+        run: bun build --compile scripts/upgrade-e2e/bad-host.ts --outfile "$BUILDS/99.0.0/$ASSET"
+
+      # SHA256SUMS comes with publishing, which has not happened yet for a draft.
+      - name: Sum them
+        run: bun scripts/upgrade-e2e/sums.ts "$BUILDS" "$ASSET"
+
+      # A password this run makes up: the runner's account has none anyone knows, and a Windows
+      # service cannot log on without one.
+      - name: Give the account a password
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $password = "Eta-" + [guid]::NewGuid().ToString("N") + "-1a"
+          Write-Output "::add-mask::$password"
+          net user $env:USERNAME $password | Out-Null
+          "ETA_E2E_PASSWORD=$password" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      # The runner has a user manager only once something asks for one.
+      - name: Start the user's systemd
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          runtime=/run/user/$(id -u)
+          timeout 30 bash -c "until [[ -S $runtime/bus ]]; do sleep 0.2; done"
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+
+      - name: Upgrade
+        run: bun scripts/upgrade-e2e/drive.ts "$BUILDS"
+
+      - name: What the service left
+        if: failure()
+        run: |
+          mkdir -p e2e-logs
+          cp upgrade-e2e-results.json e2e-logs/ || true
+          cp ~/.eta/upgrade-status.json e2e-logs/ || true
+          cp ~/.eta/service/*.log e2e-logs/ || true
+          cp ~/Library/Logs/eta/*.log e2e-logs/ || true
+          journalctl --user -u io.eta.host -u io.eta.host-upgrade -n 300 > e2e-logs/journal.txt || true
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: upgrade-cross-${{ matrix.platform }}-from-${{ matrix.from }}
+          path: e2e-logs
+          retention-days: 14

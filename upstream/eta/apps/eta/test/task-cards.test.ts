@@ -1,0 +1,569 @@
+/**
+ * Task drafts and cards: an agent proposes work as a row of the conversation, the user confirms
+ * it, and the same row becomes the task's card and follows the task from then on.
+ */
+import type {
+  BoardTaskDetail,
+  MessageView,
+  TaskActivityView,
+  TaskCardData,
+} from "@eta/client-contracts";
+import type { World } from "./support/world";
+import { describe, expect, it } from "vitest";
+import { until } from "./support/client";
+import { call, say, scriptedModels } from "./support/models";
+import { world } from "./support/world";
+
+/** Ada drafts a task the first time she is spoken to, and says so. */
+async function drafted() {
+  const { models } = scriptedModels((request) =>
+    request.lastRole === "toolResult"
+      ? say("Drafted.")
+      : call("draft_task", {
+          title: "Fix login",
+          goal: "Users can sign in again",
+          decided: "Keep the existing form",
+          acceptance: "The sign-in test passes",
+        }),
+  );
+  const w = await world({ models, tasks: { runs: false } });
+  const ada = await w.agent("Ada");
+  const project = await w.project();
+  const group = await w.group(project.id, [ada.id], "login");
+  await w.watch(group.id);
+  const sent = await w.send(group.id, "we should fix login");
+  await w.settled(group.id, sent.replies[0]!.id);
+  const draft = w.rows(group.id).find((row) => row.kind === "task_draft")!;
+  return { w, ada, project, group, draft, reply: sent.replies[0]! };
+}
+
+const confirm = async (
+  w: World,
+  conversationId: string,
+  messageId: string,
+  edits?: Record<string, unknown>,
+) =>
+  (await w.client.call("tasks", "confirmDraft", {
+    conversationId,
+    messageId,
+    ...(edits === undefined ? {} : { edits }),
+  })) as { task: BoardTaskDetail; message: MessageView };
+
+const revisionOf = (w: World, id: string): number =>
+  w.host.db
+    .query<{ revision: number }, [string]>(
+      "SELECT revision FROM message WHERE id = ?",
+    )
+    .get(id)!.revision;
+
+describe("a task draft", () => {
+  it("is a row of the conversation, composed by the board, and makes no task", async () => {
+    const { w, ada, group, draft, reply } = await drafted();
+    expect(draft).toMatchObject({
+      author: "agent",
+      agentId: ada.id,
+      status: "done",
+      text: "",
+      data: { title: "Fix login" },
+    });
+    // It names the reply it came out of, so the page can draw it inside that turn instead of
+    // guessing at the order, and that row is the one Ada was writing when she drafted.
+    expect(draft.data.turnMessageId).toBe(reply.id);
+    const { description } = draft.data as { description: string };
+    expect(description).toContain("## Goal\n\nUsers can sign in again");
+    expect(description).toContain("## Decided\n\nKeep the existing form");
+    expect(description).toContain(
+      "## Acceptance criteria\n\nThe sign-in test passes",
+    );
+    // Where it came from: the conversation, and the rows from the message that woke Ada on.
+    expect(description).toContain(
+      "Source: conversation “login”, messages 1–2.",
+    );
+    expect(w.host.db.query("SELECT COUNT(*) AS n FROM task").get()).toEqual({
+      n: 0,
+    });
+    // It sits after the reply that made it, and is read as the agent's.
+    const rows = w.rows(group.id);
+    expect(rows.map((row) => row.kind)).toEqual([
+      "message",
+      "message",
+      "task_draft",
+    ]);
+  });
+
+  it("becomes a task and a card on confirm, and keeps its place in the timeline", async () => {
+    const { w, ada, project, group, draft, reply } = await drafted();
+    const { task, message } = await confirm(w, group.id, draft.id, {
+      title: "  Fix the login form ",
+      status: "in_review",
+    });
+    expect(task).toMatchObject({
+      number: 1,
+      title: "Fix the login form",
+      status: "in_review",
+      conversationId: group.id,
+      // The agent that proposed it executes it, in the conversation's project.
+      createdBy: { kind: "agent", agentId: ada.id },
+      originConversationId: group.id,
+      projectId: project.id,
+      workspace: { mode: "local", base: null, path: null, branch: null },
+      // Not edited, so it is the draft's.
+      description: (draft.data as { description: string }).description,
+    });
+    expect(message).toMatchObject({
+      id: draft.id,
+      seq: draft.seq,
+      kind: "task_card",
+      author: "agent",
+      revision: draft.revision + 1,
+    });
+    expect(message.data).toEqual({
+      taskId: task.id,
+      number: 1,
+      title: "Fix the login form",
+      status: "in_review",
+      runStatus: null,
+      conversationId: group.id,
+      comments: 0,
+      summary: "",
+      artifacts: [],
+      // The card keeps the turn the draft was written in: it stays where the proposal was.
+      turnMessageId: reply.id,
+    });
+    // The client's timeline has the card where the draft was.
+    await until(() => w.row(group.id, draft.id)?.kind === "task_card");
+    expect(w.rows(group.id).filter((row) => row.id === draft.id)).toHaveLength(
+      1,
+    );
+
+    w.client.subscribe(`tasks.${task.id}`);
+    await until(
+      () => w.client.section(`tasks.${task.id}`, "activity") !== undefined,
+    );
+    const created = w.client.section<TaskActivityView[]>(
+      `tasks.${task.id}`,
+      "activity",
+    )![0]!;
+    expect(created).toMatchObject({
+      kind: "created",
+      actor: { kind: "agent", agentId: ada.id },
+      data: { status: "in_review", draftId: draft.id },
+    });
+  });
+
+  it("carries a base and an assignee the draft named, so one task can be for another agent and on another line", async () => {
+    // Ada drafts on Bola's behalf, based on task #1's branch. Task #1 is made straight on the
+    // board, which is the same thing a confirmed draft does.
+    const { w, ada, project, group } = await drafted();
+    const first = await confirm(
+      w,
+      group.id,
+      w.rows(group.id).find((row) => row.kind === "task_draft")!.id,
+    );
+    expect(first.task.number).toBe(1);
+    const bola = await w.agent("Bola");
+    await w.client.call("conversations", "invite", {
+      conversationId: group.id,
+      agentId: bola.id,
+    });
+    // The draft comes through the agent tool, as it would in a real conversation.
+    const draft2 = w.host.product.board.draft({
+      conversationId: group.id,
+      agentId: ada.id,
+      draft: {
+        title: "Follow up",
+        goal: "Do the follow-up",
+        acceptance: "It is done",
+        workspace: "local",
+        assignee: bola.id,
+        base: "#1",
+      },
+    });
+    const { task } = await confirm(w, group.id, draft2.id);
+    expect(task).toMatchObject({
+      number: 2,
+      createdBy: { kind: "agent", agentId: ada.id },
+      assigneeAgentId: bola.id,
+    });
+    expect(task.workspace).toMatchObject({ base: "eta/task-1" });
+    // The stored row says it too: the worktree will start there, not at the checkout's HEAD.
+    expect(
+      w.host.db
+        .query<
+          { base_branch: string | null; assignee_agent: string | null },
+          []
+        >("SELECT base_branch, assignee_agent FROM task WHERE number = 2")
+        .get(),
+    ).toEqual({ base_branch: "eta/task-1", assignee_agent: bola.id });
+    void project;
+  });
+
+  it("stores the registry id when the draft names the assignee by name, and refuses a name nobody has", async () => {
+    // #44: a draft named its assignee `林老师`, the row kept the name, and no run could find it.
+    const { w, ada, group } = await drafted();
+    const lin = await w.agent("林老师");
+    await w.client.call("conversations", "invite", {
+      conversationId: group.id,
+      agentId: lin.id,
+    });
+    const draft = w.host.product.board.draft({
+      conversationId: group.id,
+      agentId: ada.id,
+      draft: {
+        title: "For Lin",
+        goal: "Do it",
+        acceptance: "It is done",
+        workspace: "local",
+        assignee: "林老师",
+      },
+    });
+    expect(draft.data.assignee).toBe(lin.id);
+    const { task } = await confirm(w, group.id, draft.id);
+    expect(task.assigneeAgentId).toBe(lin.id);
+    expect(
+      w.host.db
+        .query<{ assignee_agent: string | null }, [string]>(
+          "SELECT assignee_agent FROM task WHERE id = ?",
+        )
+        .get(task.id),
+    ).toEqual({ assignee_agent: lin.id });
+
+    // A name nobody has makes no draft, and says what it was given and who there is.
+    let refused = "";
+    try {
+      w.host.product.board.draft({
+        conversationId: group.id,
+        agentId: ada.id,
+        draft: {
+          title: "For nobody",
+          goal: "Do it",
+          acceptance: "It is done",
+          workspace: "local",
+          assignee: "潘老师",
+        },
+      });
+    } catch (error) {
+      refused = (error as Error).message;
+    }
+    expect(refused).toContain('"潘老师"');
+    expect(refused).toContain(`林老师 (${lin.id})`);
+    expect(refused).toContain(`Ada (${ada.id})`);
+    expect(
+      w.rows(group.id).filter((row) => row.kind === "task_draft"),
+    ).toHaveLength(1);
+  });
+
+  it("refuses assignees outside the group or Captain on draft and re-checks membership at confirmation", async () => {
+    const w = await world({ captain: true, tasks: { runs: false } });
+    const ada = await w.agent("Ada");
+    const bola = await w.agent("Bola");
+    const outsider = await w.agent("Outsider");
+    const project = await w.project();
+    const group = await w.group(project.id, [ada.id, bola.id], "scoped-draft");
+    const captain = (await w.client.call("captain", "ensure", {})) as {
+      identity: { agentId: string };
+    };
+
+    expect(() =>
+      w.host.product.board.draft({
+        conversationId: group.id,
+        agentId: ada.id,
+        draft: {
+          title: "Outsider work",
+          goal: "Blocked",
+          acceptance: "Never drafted",
+          workspace: "local",
+          assignee: outsider.id,
+        },
+      }),
+    ).toThrow(/not a member of group "scoped-draft"/);
+
+    for (const target of [captain.identity.agentId, "Captain"])
+      expect(() =>
+        w.host.product.board.draft({
+          conversationId: group.id,
+          agentId: ada.id,
+          draft: {
+            title: "Captain work",
+            goal: "Blocked",
+            acceptance: "Never drafted",
+            workspace: "local",
+            assignee: target,
+          },
+        }),
+      ).toThrow(/Captain cannot be assigned/);
+
+    // Valid draft for Bola, then Bola leaves the group before user confirms.
+    const assignedDraft = w.host.product.board.draft({
+      conversationId: group.id,
+      agentId: ada.id,
+      draft: {
+        title: "For Bola",
+        goal: "Needs member",
+        acceptance: "Checks on confirm",
+        workspace: "local",
+        assignee: bola.id,
+      },
+    });
+    // Self-assigned draft by Bola as well, before Bola leaves.
+    const selfDraft = w.host.product.board.draft({
+      conversationId: group.id,
+      agentId: bola.id,
+      draft: {
+        title: "Self draft",
+        goal: "Needs member",
+        acceptance: "Checks on confirm",
+        workspace: "local",
+      },
+    });
+    await w.client.call("conversations", "remove", {
+      conversationId: group.id,
+      agentId: bola.id,
+    });
+
+    await expect(confirm(w, group.id, assignedDraft.id)).rejects.toThrow(
+      /not a member of group "scoped-draft"/,
+    );
+    await expect(confirm(w, group.id, selfDraft.id)).rejects.toThrow(
+      /no longer a member of group "scoped-draft"/,
+    );
+  });
+
+  it("confirms once: a second confirm, edited or not, is the same task", async () => {
+    const { w, group, draft } = await drafted();
+    const first = await confirm(w, group.id, draft.id);
+    const revision = revisionOf(w, draft.id);
+    expect(first.task).toMatchObject({ status: "todo" });
+
+    const second = await confirm(w, group.id, draft.id, { title: "Other" });
+    expect(second.task.id).toBe(first.task.id);
+    expect(second.task.title).toBe("Fix login");
+    expect(second.message.revision).toBe(revision);
+    expect(revisionOf(w, draft.id)).toBe(revision);
+    expect(w.host.db.query("SELECT COUNT(*) AS n FROM task").get()).toEqual({
+      n: 1,
+    });
+    expect(
+      w.host.db.query("SELECT COUNT(*) AS n FROM task_activity").get(),
+    ).toEqual({ n: 1 });
+  });
+
+  it("is discarded once: no task, the row stays marked, and it cannot be confirmed", async () => {
+    const { w, group, draft } = await drafted();
+    const discard = (id: string) =>
+      w.client.call("tasks", "discardDraft", {
+        conversationId: group.id,
+        messageId: id,
+      }) as Promise<{ message: MessageView }>;
+    const { message } = await discard(draft.id);
+    expect(message).toMatchObject({
+      kind: "task_draft",
+      data: { discarded: true, turnMessageId: draft.data.turnMessageId },
+    });
+    expect(
+      w.rows(group.id).find((row) => row.id === draft.id)!.data.discarded,
+    ).toBe(true);
+    expect(w.host.db.query("SELECT COUNT(*) AS n FROM task").get()).toEqual({
+      n: 0,
+    });
+    await expect(discard(draft.id)).rejects.toThrow(/already discarded/);
+    await expect(confirm(w, group.id, draft.id)).rejects.toThrow(
+      /draft was discarded/,
+    );
+    expect(w.host.db.query("SELECT COUNT(*) AS n FROM task").get()).toEqual({
+      n: 0,
+    });
+  });
+
+  it("is not discarded once confirmed", async () => {
+    const { w, group, draft } = await drafted();
+    await confirm(w, group.id, draft.id);
+    await expect(
+      w.client.call("tasks", "discardDraft", {
+        conversationId: group.id,
+        messageId: draft.id,
+      }),
+    ).rejects.toThrow(/already confirmed/);
+  });
+
+  const decisions = (w: World, conversationId: string) =>
+    w
+      .rows(conversationId)
+      .filter(
+        (row) =>
+          row.kind === "system" && row.data.event === "task_draft_decided",
+      );
+
+  it("tells the agent that drafted it the task number once confirmed, and only once", async () => {
+    const { w, ada, group, draft } = await drafted();
+    expect(decisions(w, group.id)).toEqual([]);
+    const { task } = await confirm(w, group.id, draft.id);
+    await confirm(w, group.id, draft.id);
+    const told = decisions(w, group.id);
+    expect(told).toHaveLength(1);
+    expect(told[0]!.text).toContain("Fix login");
+    expect(told[0]!.text).toContain(`created as task #${task.number}`);
+    expect(told[0]!.data).toMatchObject({
+      draftId: draft.id,
+      agentId: ada.id,
+      outcome: "created",
+      taskId: task.id,
+      number: task.number,
+    });
+  });
+
+  it("tells the agent that drafted it the draft was discarded, and only once", async () => {
+    const { w, ada, group, draft } = await drafted();
+    const discard = () =>
+      w.client.call("tasks", "discardDraft", {
+        conversationId: group.id,
+        messageId: draft.id,
+      });
+    await discard();
+    await expect(discard()).rejects.toThrow(/already discarded/);
+    const told = decisions(w, group.id);
+    expect(told).toHaveLength(1);
+    expect(told[0]!.text).toContain("discarded, no task was made");
+    expect(told[0]!.data).toMatchObject({
+      agentId: ada.id,
+      outcome: "discarded",
+    });
+  });
+
+  it("tells nobody when a confirm fails", async () => {
+    const { w, group, draft } = await drafted();
+    await expect(
+      confirm(w, group.id, draft.id, { title: "  " }),
+    ).rejects.toThrow(/needs a title/);
+    await expect(
+      confirm(w, group.id, draft.id, { status: "finished" }),
+    ).rejects.toThrow(/status must be one of/);
+    expect(decisions(w, group.id)).toEqual([]);
+    expect(w.rows(group.id).find((row) => row.id === draft.id)?.kind).toBe(
+      "task_draft",
+    );
+  });
+
+  it("tells nobody when no agent is behind the draft", async () => {
+    const { w, group, draft } = await drafted();
+    w.host.db.run("UPDATE message SET agent_id = NULL WHERE id = ?", [
+      draft.id,
+    ]);
+    await confirm(w, group.id, draft.id);
+    expect(decisions(w, group.id)).toEqual([]);
+  });
+
+  it("is refused when the row is not a draft of that conversation", async () => {
+    const { w, ada, project, group, draft } = await drafted();
+    const other = await w.group(project.id, [ada.id], "elsewhere");
+    const user = w.rows(group.id).find((row) => row.author === "user")!;
+
+    await expect(confirm(w, group.id, user.id)).rejects.toThrow(
+      /no such task draft/,
+    );
+    await expect(confirm(w, group.id, "nope")).rejects.toThrow(
+      /no such task draft/,
+    );
+    // The draft is in `group`; naming another conversation does not find it.
+    await expect(confirm(w, other.id, draft.id)).rejects.toThrow(
+      /no such task draft/,
+    );
+    await expect(
+      confirm(w, group.id, draft.id, { status: "finished" }),
+    ).rejects.toThrow(/status must be one of/);
+    // None of those turned it into anything.
+    expect(w.rows(group.id).find((row) => row.id === draft.id)?.kind).toBe(
+      "task_draft",
+    );
+  });
+});
+
+describe("a task card", () => {
+  const card = (w: World, conversationId: string, id: string) =>
+    w.row(conversationId, id)!.data as unknown as TaskCardData;
+
+  it("says what the task says, and moves its revision when the task changes", async () => {
+    const { w, ada, project, group, draft, reply } = await drafted();
+    const { task } = await confirm(w, group.id, draft.id);
+    const other = await w.group(project.id, [ada.id], "elsewhere");
+    // Refreshing a card rewrites its facts and keeps the turn it belongs to.
+    expect(card(w, group.id, draft.id).turnMessageId).toBe(reply.id);
+    let revision = revisionOf(w, draft.id);
+
+    await w.client.call("tasks", "update", {
+      taskId: task.id,
+      status: "in_progress",
+      title: "Fix the login form",
+    });
+    await until(() => card(w, group.id, draft.id).status === "in_progress");
+    expect(card(w, group.id, draft.id).title).toBe("Fix the login form");
+    expect(revisionOf(w, draft.id)).toBeGreaterThan(revision);
+    revision = revisionOf(w, draft.id);
+
+    await w.client.call("tasks", "comment", {
+      taskId: task.id,
+      body: "first look",
+    });
+    await w.client.call("tasks", "comment", {
+      taskId: task.id,
+      body: "found the cause",
+    });
+    await until(() => card(w, group.id, draft.id).comments === 2);
+    expect(card(w, group.id, draft.id).summary).toBe("found the cause");
+    revision = revisionOf(w, draft.id);
+
+    // A change that changes nothing does not touch the card.
+    await w.client.call("tasks", "update", {
+      taskId: task.id,
+      status: "in_progress",
+    });
+    expect(revisionOf(w, draft.id)).toBe(revision);
+
+    // The card follows the task's link, and stays where it was proposed.
+    await w.client.call("tasks", "link", {
+      taskId: task.id,
+      conversationId: other.id,
+    });
+    await until(() => card(w, group.id, draft.id).conversationId === other.id);
+    expect(w.row(group.id, draft.id)?.conversationId).toBe(group.id);
+    expect(revisionOf(w, draft.id)).toBeGreaterThan(revision);
+  });
+
+  it("stays behind when its task is deleted, and says so", async () => {
+    const { w, group, draft } = await drafted();
+    const { task } = await confirm(w, group.id, draft.id, { status: "done" });
+    await w.client.call("tasks", "delete", { taskId: task.id });
+
+    await until(() => card(w, group.id, draft.id).deleted === true);
+    expect(w.row(group.id, draft.id)).toMatchObject({
+      kind: "task_card",
+      data: { number: 1, title: "Fix login", status: "done", deleted: true },
+    });
+    // There is nothing left to confirm into.
+    await expect(confirm(w, group.id, draft.id)).rejects.toThrow(
+      /task was deleted/,
+    );
+  });
+
+  it("is made by a confirmed draft only: making or commenting on a task another way puts no card anywhere", async () => {
+    const { w, ada, group } = await drafted();
+    const made = w.host.product.board.create(
+      {
+        title: "By the agent's tool",
+        conversationId: group.id,
+        workspace: "local",
+        status: "backlog",
+      },
+      { kind: "agent", agentId: ada.id },
+    );
+    await w.client.call("tasks", "comment", {
+      taskId: made.id,
+      body: "hello",
+    });
+    expect(w.rows(group.id).map((row) => row.kind)).toEqual([
+      "message",
+      "message",
+      "task_draft",
+    ]);
+  });
+});

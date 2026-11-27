@@ -1,0 +1,512 @@
+# A `desktop-v*` tag becomes a GitHub Release of the client app: an installer for each desktop
+# platform, an Android APK, an iOS IPA, a HarmonyOS HAP, and SHA256SUMS. The host is released apart, from `v*` tags (release.yml). How to cut either is
+# in docs/release.md.
+#
+# With an update key configured, the release also feeds the apps' own updates: the desktop
+# apps' update archives and Android's OTA package go on the release, and a signed `latest.json`
+# on the fixed `desktop-channel-stable` / `desktop-channel-rc` releases points at them ("The
+# client app's own updates" in docs/release.md).
+name: Release desktop
+
+on:
+  push:
+    tags: ["desktop-v*"]
+  # For a tag whose run never happened or was lost, by naming it as the ref:
+  # `gh workflow run release-desktop.yml --ref desktop-v0.2.0`.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.ref_name }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  # All of it: --affected compares with main, and a tag on main has nothing to compare.
+  check:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      all: true
+
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      update-url: ${{ steps.channels.outputs.url }}
+      update-channels: ${{ steps.channels.outputs.channels }}
+      download-base: ${{ steps.channels.outputs.base }}
+    steps:
+      - name: Read the version from the tag
+        id: version
+        run: |
+          if [[ $GITHUB_REF_TYPE != tag || ! $TAG =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::A desktop release runs on a tag like desktop-v0.2.0, not on $GITHUB_REF."
+            exit 1
+          fi
+          echo "version=${TAG#desktop-v}" >> "$GITHUB_OUTPUT"
+
+      # Where the apps look for updates, fixed in each build: a manifest per channel on a release
+      # of its own (never Latest: that is the host's, and nsh's `github` source would read it). An
+      # rc build looks at rc by default, a full release at stable; the desktop's settings choose
+      # either by name. ETA_CLIENT_DOWNLOAD_BASE stands in for this repository's download URL, for
+      # a test from a private repository, whose downloads need a token the apps do not have.
+      - name: Name the update channels
+        id: channels
+        if: vars.ETA_CLIENT_UPDATE_PUBLIC_KEY != ''
+        env:
+          BASE: ${{ vars.ETA_CLIENT_DOWNLOAD_BASE || format('{0}/{1}/releases/download', github.server_url, github.repository) }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          own=stable
+          if [[ $VERSION == *-* ]]; then own=rc; fi
+          {
+            echo "base=$BASE"
+            echo "url=$BASE/desktop-channel-$own/latest.json"
+            echo "channels=stable=$BASE/desktop-channel-stable/latest.json,rc=$BASE/desktop-channel-rc/latest.json"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      # Never the repository's Latest: that is the host's, and what `eta-host upgrade` and the
+      # install instructions mean by the latest release (packages/releases/src/releases.ts only
+      # takes v* tags in any case). The notes start from the previous desktop release, not from
+      # whatever release of either kind came before.
+      - name: Open the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANDROID_KEYSTORE: ${{ secrets.ETA_ANDROID_KEYSTORE }}
+          IOS_CERTIFICATE: ${{ secrets.ETA_IOS_CERTIFICATE }}
+        run: |
+          draft=$(gh release view "$TAG" --json isDraft --jq .isDraft || echo none)
+          if [[ $draft == false ]]; then
+            echo "::error::$TAG is already published."
+            exit 1
+          fi
+          if [[ $draft == none ]]; then
+            # Newest first; drafts are left out, so a tag whose run failed does not count.
+            previous=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+              --jq '.[] | select(.draft | not) | .tag_name' |
+              grep -E '^desktop-v[0-9]' | grep -vxF "$TAG" | head -n 1 || true)
+            notes=()
+            if [[ -n $previous ]]; then
+              notes+=(--notes-start-tag "$previous")
+            else
+              echo "::warning::No earlier desktop-v* release: the notes go back to GitHub's default."
+            fi
+            {
+              if [[ -z $ANDROID_KEYSTORE ]]; then
+                echo "> **Android:** \`eta-android.apk\` is signed with a debug key made for this build, as no release keystore is configured. Android will not install the next one over it: uninstall it first, which clears the app's data."
+                echo
+              fi
+              if [[ -z $IOS_CERTIFICATE ]]; then
+                echo "> **iOS:** \`eta-ios.ipa\` is unsigned, as no signing certificate is configured. Install it with a tool that signs it for your device (AltStore, Sideloadly, or \`codesign\` with your own profile)."
+                echo
+              fi
+              echo "> **HarmonyOS:** \`eta-harmonyos.hap\` is unsigned (built with the OpenHarmony 7.0 SDK). Sign it with your own certificate before installing on a device."
+              echo
+            } > "$RUNNER_TEMP/notes.md"
+            # Prepended to the generated notes, after a blank line, or the last quote would swallow them.
+            if [[ -s $RUNNER_TEMP/notes.md ]]; then
+              notes+=(--notes "$(cat "$RUNNER_TEMP/notes.md")"$'\n\n')
+            fi
+            # A pre-release by its version: the tag itself always has a `-` in it.
+            gh release create "$TAG" --draft --verify-tag --title "eta desktop ${TAG#desktop-v}" \
+              --generate-notes "${notes[@]}" --latest=false \
+              --prerelease="$([[ ${TAG#desktop-v} == *-* ]] && echo true || echo false)"
+          fi
+
+  build:
+    needs: prepare
+    strategy:
+      # The others finish, so a rerun is only of the one that failed.
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux
+            runner: ubuntu-latest
+            desktop: eta-desktop-linux-x64.tar.gz
+          - target: macos
+            runner: macos-latest
+            desktop: eta-desktop-darwin-arm64.dmg
+          - target: windows
+            runner: windows-latest
+            desktop: eta-desktop-windows-x64.zip
+          # arm64-v8a and armeabi-v7a, nsh's default.
+          - target: android
+            runner: ubuntu-latest
+            desktop: eta-android.apk
+          - target: ios
+            runner: macos-latest
+            desktop: eta-ios.ipa
+          - target: harmonyos
+            runner: ubuntu-latest
+            desktop: eta-harmonyos.hap
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        # Git's bash on Windows, so every platform runs the same steps.
+        shell: bash
+    env:
+      DESKTOP: ${{ matrix.desktop }}
+      ETA_DESKTOP_VERSION: ${{ needs.prepare.outputs.version }}
+      # The app downloads its host from this repository, so a fork's app follows the fork.
+      ETA_HOST_UPSTREAM: ${{ github.api_url }}/repos/${{ github.repository }}
+      ETA_DESKTOP_TARGET: ${{ matrix.target }}
+      # iOS updates through the store and HarmonyOS ships unsigned HAPs: no update source in their builds.
+      ETA_CLIENT_UPDATE_URL: ${{ matrix.target != 'ios' && matrix.target != 'harmonyos' && needs.prepare.outputs.update-url || '' }}
+      ETA_CLIENT_UPDATE_CHANNELS: ${{ matrix.target != 'ios' && matrix.target != 'harmonyos' && needs.prepare.outputs.update-channels || '' }}
+      ETA_CLIENT_UPDATE_PUBLIC_KEY: ${{ matrix.target != 'ios' && matrix.target != 'harmonyos' && needs.prepare.outputs.update-url && vars.ETA_CLIENT_UPDATE_PUBLIC_KEY || '' }}
+      # The OTA root Android builds trust: packages signed by a release key it certified run in them.
+      ETA_CLIENT_PACKAGE_ROOT: ${{ matrix.target == 'android' && vars.ETA_CLIENT_PACKAGE_ROOT || '' }}
+    steps:
+      # What is built is what is in git: Windows runners would check out CRLF.
+      - run: git config --global core.autocrlf false
+
+      # Dependencies' code runs here too, in a job that can write releases.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - run: bun install --frozen-lockfile --ignore-scripts
+
+      - uses: ./.github/actions/setup-nsh
+
+      # A release key when the repository has one; nsh's debug key otherwise, which the notes say.
+      - name: Android signing
+        if: matrix.target == 'android'
+        env:
+          KEYSTORE: ${{ secrets.ETA_ANDROID_KEYSTORE }}
+          KEY_ALIAS: ${{ secrets.ETA_ANDROID_KEY_ALIAS }}
+        run: |
+          if [[ -n $KEYSTORE ]]; then
+            base64 --decode <<< "$KEYSTORE" > "$RUNNER_TEMP/release.jks"
+            echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          fi
+
+      # A distribution certificate and profile when the repository has them, in a keychain of this
+      # job's own; an unsigned IPA otherwise, which the notes say.
+      - name: iOS signing
+        if: matrix.target == 'ios'
+        env:
+          CERTIFICATE: ${{ secrets.ETA_IOS_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.ETA_IOS_CERTIFICATE_PASSWORD }}
+          PROFILE: ${{ secrets.ETA_IOS_PROFILE }}
+          IDENTITY: ${{ secrets.ETA_IOS_SIGN_IDENTITY }}
+        run: |
+          if [[ -n $CERTIFICATE ]]; then
+            keychain="$RUNNER_TEMP/eta.keychain-db"
+            password=$(openssl rand -hex 16)
+            base64 --decode <<< "$CERTIFICATE" > "$RUNNER_TEMP/eta.p12"
+            base64 --decode <<< "$PROFILE" > "$RUNNER_TEMP/eta.mobileprovision"
+            security create-keychain -p "$password" "$keychain"
+            security set-keychain-settings -lut 3600 "$keychain"
+            security unlock-keychain -p "$password" "$keychain"
+            security import "$RUNNER_TEMP/eta.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain" > /dev/null
+            security list-keychains -d user -s "$keychain" login.keychain-db
+            echo "IOS_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+            echo "IOS_PROFILE=$RUNNER_TEMP/eta.mobileprovision" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: matrix.target == 'harmonyos'
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-java@v4
+        if: matrix.target == 'harmonyos'
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.target == 'harmonyos'
+        with:
+          targets: aarch64-unknown-linux-ohos
+
+      - name: Cache OpenHarmony 7.0 SDK (API 26)
+        if: matrix.target == 'harmonyos'
+        id: ohos-sdk
+        uses: actions/cache@v4
+        with:
+          path: ~/ohos-sdk
+          key: ohos-sdk-7.0-release-linux-api26-v1
+
+      - name: Download OpenHarmony 7.0 SDK
+        if: matrix.target == 'harmonyos' && steps.ohos-sdk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          tmp="$RUNNER_TEMP/ohos-sdk-download"
+          mkdir -p "$tmp" ~/ohos-sdk/26.0.0
+          curl -fL --retry 3 "https://repo.huaweicloud.com/openharmony/os/7.0-Release/ohos-sdk-windows_linux-public.tar.gz" -o "$tmp/ohos-sdk.tar.gz"
+          tar -xzf "$tmp/ohos-sdk.tar.gz" -C "$tmp"
+          find "$tmp" -path '*/linux/*.zip' -exec unzip -q -o {} -d ~/ohos-sdk/26.0.0 \;
+          ln -sfn 26.0.0 ~/ohos-sdk/26
+          rm -rf "$tmp"
+
+      - name: Cache hvigor
+        if: matrix.target == 'harmonyos'
+        id: hvigor
+        uses: actions/cache@v4
+        with:
+          path: ~/hvigor
+          key: ohos-hvigor-npm-v1
+
+      - name: Install hvigor
+        if: matrix.target == 'harmonyos' && steps.hvigor.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/hvigor
+          npm --prefix ~/hvigor install @ohos/hvigor @ohos/hvigor-ohos-plugin --registry https://repo.harmonyos.com/npm/
+
+      - name: Cache Rust and NSH HarmonyOS build artifacts
+        if: matrix.target == 'harmonyos'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            apps/client/.nsh/platforms/harmonyos/target
+            apps/client/.nsh/harmonyos/runner/target
+          key: harmonyos-client-rust-${{ hashFiles('apps/client/harmonyos.nsh.lock') }}
+          restore-keys: |
+            harmonyos-client-rust-
+
+      - name: Package the app
+        env:
+          NSH_KEYSTORE_PASSWORD: ${{ secrets.ETA_ANDROID_KEYSTORE_PASSWORD }}
+          # The phone apps' version code: it only ever grows, as Android needs to install over.
+          ETA_CLIENT_BUILD: ${{ github.run_number }}
+        run: |
+          out="$RUNNER_TEMP/eta-desktop"
+          mkdir -p "$out" "$RUNNER_TEMP/try"
+          args=(--target "$ETA_DESKTOP_TARGET" --app-version "$ETA_DESKTOP_VERSION" --out "$out")
+          case "$ETA_DESKTOP_TARGET" in
+            android)
+              args+=(--build "$ETA_CLIENT_BUILD")
+              if [[ -n ${ANDROID_KEYSTORE_FILE:-} ]]; then
+                args+=(--keystore "$ANDROID_KEYSTORE_FILE" --key-alias "$ANDROID_KEY_ALIAS")
+              fi
+              ;;
+            ios)
+              args+=(--build "$ETA_CLIENT_BUILD")
+              if [[ -n ${IOS_IDENTITY:-} ]]; then args+=(--sign "$IOS_IDENTITY" --profile "$IOS_PROFILE"); fi
+              ;;
+            harmonyos)
+              export OHOS_BASE_SDK_HOME="$HOME/ohos-sdk"
+              export OHOS_NDK_HOME="$HOME/ohos-sdk/26.0.0"
+              export HVIGOR_HOME="$HOME/hvigor"
+              export CARGO_PROFILE_RELEASE_LTO=false
+              export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+              export CARGO_INCREMENTAL=0
+              args+=(--runtime-os openharmony --build "$ETA_CLIENT_BUILD")
+              ;;
+          esac
+          bun run client:package "${args[@]}"
+          case "$ETA_DESKTOP_TARGET" in
+            macos)
+              codesign --verify --deep "$out/Eta.app"
+              test -x "$out/Eta.app/Contents/Resources/nsh/eta-bootstrap"
+              # appdmg lays the window out from apps/client/dmg.json: the app and a link to
+              # /Applications at 180,190 and 480,190 in a 660x400 window, on the background beside
+              # them. Its files sit in the spec's own directory, which is how it resolves them.
+              dmg="$RUNNER_TEMP/eta-dmg"
+              mkdir -p "$dmg"
+              ditto "$out/Eta.app" "$dmg/Eta.app"
+              cp apps/client/dmg.json apps/client/dmg/background.png "$dmg/"
+              iconutil -c icns apps/client/icon.iconset -o "$dmg/Eta.icns"
+              # npm, not bunx: appdmg 0.6.6 pulls macos-alias and ds-store, whose install
+              # scripts run `node-gyp rebuild`, and bun's installer cannot resolve node-gyp's
+              # executable — it fails the run with 'could not determine executable to run for
+              # package node-gyp' and then 'install script from macos-alias exited with 1'. npm
+              # ships node-gyp and puts it on the script's PATH.
+              npx --yes appdmg@0.6.6 "$dmg/dmg.json" "$RUNNER_TEMP/try/$DESKTOP"
+              ;;
+            linux)
+              test -x "$out/Eta/nsh/eta-bootstrap"
+              cp "$out/Eta.tar.gz" "$RUNNER_TEMP/try/$DESKTOP"
+              ;;
+            windows)
+              test -f "$out/Eta/eta-bootstrap.exe"
+              cp "$out/Eta.zip" "$RUNNER_TEMP/try/$DESKTOP"
+              ;;
+            android)
+              cp "$out/Eta.apk" "$RUNNER_TEMP/try/$DESKTOP"
+              ;;
+            ios)
+              if [[ -f "$out/Eta.ipa" ]]; then
+                cp "$out/Eta.ipa" "$RUNNER_TEMP/try/$DESKTOP"
+              else
+                # Unsigned: nsh leaves the .app, and an IPA is that in Payload/.
+                mkdir -p "$RUNNER_TEMP/ipa/Payload"
+                ditto "$out/Eta.app" "$RUNNER_TEMP/ipa/Payload/Eta.app"
+                (cd "$RUNNER_TEMP/ipa" && ditto -c -k --keepParent Payload "$RUNNER_TEMP/try/$DESKTOP")
+              fi
+              ;;
+            harmonyos)
+              hap=$(find "$out/entry/build" -type f -name '*-unsigned.hap' | head -n 1)
+              test -f "$hap"
+              cp "$hap" "$RUNNER_TEMP/try/$DESKTOP"
+              ;;
+          esac
+
+      # The same code as the APK, as a signed package that installed apps run without a new APK.
+      # Its build is this run's, as the APK's is: apps from earlier releases take it, this
+      # release's own APK already runs it.
+      - name: Sign the OTA package
+        if: matrix.target == 'android' && env.ETA_CLIENT_PACKAGE_ROOT != '' && env.ETA_CLIENT_UPDATE_URL != ''
+        env:
+          RELEASE_KEY: ${{ secrets.ETA_CLIENT_RELEASE_KEY }}
+          RELEASE_CERT: ${{ secrets.ETA_CLIENT_RELEASE_CERT }}
+          ETA_CLIENT_BUILD: ${{ github.run_number }}
+        run: |
+          if [[ -z $RELEASE_KEY || -z $RELEASE_CERT ]]; then
+            echo "::warning::No ETA_CLIENT_RELEASE_KEY / ETA_CLIENT_RELEASE_CERT: no OTA package, Android updates only by a new APK."
+            exit 0
+          fi
+          keys=$(mktemp -d)
+          printf '%s\n' "$RELEASE_KEY" > "$keys/release.secret"
+          printf '%s\n' "$RELEASE_CERT" > "$keys/release.cert"
+          bun scripts/nsh-client.ts publish --key "$keys/release.secret" --cert "$keys/release.cert" \
+            --app-version "$ETA_DESKTOP_VERSION" --build "$ETA_CLIENT_BUILD" \
+            -o "$RUNNER_TEMP/eta-desktop/dev.eta.client-$ETA_CLIENT_BUILD.nshpkg"
+          rm -rf "$keys"
+
+      - name: The build left the checkout as it was
+        run: |
+          changed=$(git status --porcelain)
+          if [[ -n $changed ]]; then
+            echo "::error::The checkout changed during the build:"
+            echo "$changed"
+            exit 1
+          fi
+
+      - name: Upload it to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" "$RUNNER_TEMP/try/$DESKTOP" --clobber
+          shopt -s nullglob
+          # The desktops' update archives (Eta-<version>-<os>-<arch>.*) and Android's OTA package.
+          updates=("$RUNNER_TEMP/eta-desktop"/Eta-"$ETA_DESKTOP_VERSION"-* "$RUNNER_TEMP/eta-desktop"/*.nshpkg)
+          if [[ -n $ETA_CLIENT_UPDATE_URL && ${#updates[@]} -gt 0 ]]; then
+            gh release upload "$TAG" "${updates[@]}" --clobber
+          fi
+
+  publish:
+    needs: [prepare, check, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      BASE: ${{ needs.prepare.outputs.download-base }}
+    steps:
+      # From the draft, so the sums are of what people will download.
+      - name: Add SHA256SUMS
+        run: |
+          gh release download "$TAG" --pattern 'eta-*' --dir assets
+          cd assets
+          sha256sum eta-* | tee SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber
+
+      # Publishing makes a release the Latest unless told otherwise.
+      - run: gh release edit "$TAG" --draft=false --latest=false
+
+      # After publishing: a draft's files cannot be downloaded, and the manifest must not point at
+      # files nobody can get.
+      - uses: actions/checkout@v7
+        if: needs.prepare.outputs.update-url != ''
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        if: needs.prepare.outputs.update-url != ''
+        with:
+          bun-version-file: package.json
+
+      - if: needs.prepare.outputs.update-url != ''
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - uses: ./.github/actions/setup-nsh
+        if: needs.prepare.outputs.update-url != ''
+
+      # One signed manifest for the release: each desktop's archive, the OTA package, and on
+      # Android the APK when it can install over the last one (only with a release keystore: a
+      # debug-signed APK cannot). Its notes are the release's.
+      - name: Write the update manifest
+        if: needs.prepare.outputs.update-url != ''
+        env:
+          UPDATE_KEY: ${{ secrets.ETA_CLIENT_UPDATE_KEY }}
+          ANDROID_KEYSTORE: ${{ secrets.ETA_ANDROID_KEYSTORE }}
+          ETA_CLIENT_VERSION: ${{ needs.prepare.outputs.version }}
+          ETA_CLIENT_UPDATE_URL: ${{ needs.prepare.outputs.update-url }}
+          ETA_CLIENT_UPDATE_PUBLIC_KEY: ${{ vars.ETA_CLIENT_UPDATE_PUBLIC_KEY }}
+          ETA_CLIENT_PACKAGE_ROOT: ${{ vars.ETA_CLIENT_PACKAGE_ROOT }}
+        run: |
+          if [[ -z $UPDATE_KEY ]]; then
+            echo "::error::ETA_CLIENT_UPDATE_PUBLIC_KEY is set but the ETA_CLIENT_UPDATE_KEY secret is not: the apps of this release cannot be offered."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/updates" "$RUNNER_TEMP/manifest"
+          gh release download "$TAG" --pattern "Eta-$VERSION-*" --pattern '*.nshpkg' --dir "$RUNNER_TEMP/updates"
+          gh release view "$TAG" --json body --jq .body > "$RUNNER_TEMP/notes.md"
+          shopt -s nullglob
+          archives=("$RUNNER_TEMP/updates"/Eta-"$VERSION"-*)
+          packages=("$RUNNER_TEMP/updates"/*.nshpkg)
+          args=(--notes "$RUNNER_TEMP/notes.md" --base-url "$BASE/$TAG/" -o "$RUNNER_TEMP/manifest")
+          if [[ ${#packages[@]} -gt 0 ]]; then args+=(--package "${packages[0]}"); fi
+          if [[ -n $ANDROID_KEYSTORE ]]; then args+=(--link "android=$BASE/$TAG/eta-android.apk"); fi
+          keys=$(mktemp -d)
+          printf '%s\n' "$UPDATE_KEY" > "$keys/update.secret"
+          bun scripts/nsh-client.ts update-manifest "${archives[@]}" "${args[@]}" --key "$keys/update.secret"
+          rm -rf "$keys"
+          cat "$RUNNER_TEMP/manifest/latest.json"
+
+      # A full release goes to both channels, an rc only to rc. A channel only moves forward: a
+      # rerun of an older tag, or a full release behind the rc already out, leaves it alone.
+      - name: Put the manifest on its channels
+        if: needs.prepare.outputs.update-url != ''
+        run: |
+          channels=(rc)
+          if [[ $VERSION != *-* ]]; then channels=(stable rc); fi
+          for channel in "${channels[@]}"; do
+            release="desktop-channel-$channel"
+            if ! gh release view "$release" > /dev/null 2>&1; then
+              # Its tag on the default branch: the job's token may not make a tag elsewhere.
+              gh release create "$release" --prerelease --latest=false \
+                --title "eta desktop updates ($channel)" \
+                --notes "Where the Eta client apps on the $channel channel look for updates: \`latest.json\` and its signature, replaced by every desktop release. The apps themselves are on the desktop-v* releases." || {
+                echo "::error::Could not create $release. Create it once by hand (gh release create $release --prerelease --latest=false --notes ...), then rerun this job."
+                exit 1
+              }
+            fi
+            current=$(curl -fsSL "$BASE/$release/latest.json" 2>/dev/null | jq -r .version || true)
+            if [[ -n $current ]] && ! bun -e 'process.exit(Bun.semver.order(process.argv[1], process.argv[2]) > 0 ? 0 : 1)' "$VERSION" "$current"; then
+              echo "::notice::$channel already offers $current, not older than $VERSION: left as it is."
+              continue
+            fi
+            # The signature last: until it is there, apps refuse the new manifest rather than trust it.
+            gh release upload "$release" "$RUNNER_TEMP/manifest"/notes.*.md --clobber 2>/dev/null || true
+            gh release upload "$release" "$RUNNER_TEMP/manifest/latest.json" --clobber
+            gh release upload "$release" "$RUNNER_TEMP/manifest/latest.json.sig" --clobber
+            echo "$channel: $VERSION"
+          done

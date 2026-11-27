@@ -1,0 +1,39 @@
+{
+  "name": "@eta/daemon",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The eta daemon: sessions on another machine, reached over one outbound connection to the primary.",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "build:all": "bun scripts/build.ts --all",
+    "typecheck": "bun check",
+    "lint": "eslint --cache --cache-location node_modules/.cache/eslint .",
+    "test": "bun --bun vitest --run --passWithNoTests",
+    "test:changed": "bun --bun vitest --run --passWithNoTests --changed HEAD"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
+    "@eta/client-contracts": "*",
+    "@eta/client-wire-proto": "*",
+    "@eta/core": "*",
+    "@eta/harness": "*",
+    "@eta/mcp": "*",
+    "@eta/places": "*",
+    "@eta/runtime-acp": "*",
+    "@eta/runtime-oar": "*",
+    "@eta/server": "*",
+    "@eta/ssh": "*",
+    "cordis": "4.0.0-rc.10"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "bun-types": "1.4.2",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

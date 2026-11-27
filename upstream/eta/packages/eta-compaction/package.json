@@ -1,0 +1,30 @@
+{
+  "name": "@eta/compaction",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The compaction summarizer for eta: cuts the history at a turn boundary, folds a summary through the model's own window, and digests what it cannot summarize.",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "test": "vitest --run --passWithNoTests",
+    "test:changed": "vitest --run --passWithNoTests --changed HEAD",
+    "typecheck": "bun check",
+    "smoke": "ETA_SMOKE_CONFIG=\"${ETA_SMOKE_CONFIG:-$HOME/.eta/config.json}\" vitest --run test/smoke.e2e.test.ts",
+    "lint": "eslint --cache --cache-location node_modules/.cache/eslint ."
+  },
+  "dependencies": {
+    "@eta/core": "*",
+    "@eta/harness": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
+    "@types/node": "22.19.19",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

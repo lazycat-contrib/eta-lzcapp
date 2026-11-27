@@ -1,0 +1,22 @@
+node_modules/
+.venv/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.sqlite3-*
+.env
+.env.*
+!.env.example
+dist/
+.output/
+.tanstack/
+.ruff_cache/
+.DS_Store
+apps/tui/src/extensions.gen.ts
+var/
+out/
+.turbo/
+.claude/settings.local.json
+
+# Turborepo
+.turbo

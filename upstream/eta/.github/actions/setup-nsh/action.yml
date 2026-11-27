@@ -1,0 +1,43 @@
+name: Set up Native Shell
+description: Install the pinned NSH CLI and verify the release archive.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        RUNNER_PLATFORM: ${{ runner.os }}
+        RUNNER_CPU: ${{ runner.arch }}
+      run: |
+        case "$RUNNER_PLATFORM/$RUNNER_CPU" in
+          Linux/X64) archive=nsh-linux-x86_64.tar.gz ;;
+          macOS/ARM64) archive=nsh-macos-arm64.tar.gz ;;
+          macOS/X64) archive=nsh-macos-x86_64.tar.gz ;;
+          Windows/X64) archive=nsh-windows-x86_64.zip ;;
+          *) echo "Unsupported NSH runner: $RUNNER_PLATFORM/$RUNNER_CPU" >&2; exit 1 ;;
+        esac
+        target="$RUNNER_TEMP/eta-nsh"
+        mkdir -p "$target"
+        cd "$target"
+        # Pinned to v0.7.1: v0.7.0 is the first stable release containing the Windows
+        # IME fix (longbridge/nsh#2497, merge commit d474e13), and v0.7.1 is its patch
+        # release (Windows title-bar accent leak, HiDPI Input wheel scrolling, and
+        # runtime GStreamer loading on Linux).
+        url="https://github.com/longbridge/nsh/releases/download/v0.7.1/$archive"
+        curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
+        curl --fail --silent --show-error --location --retry 3 --output checksum "$url.sha256"
+        digest=$(awk 'NR == 1 { print $1 }' checksum)
+        if command -v sha256sum >/dev/null; then
+          printf '%s  %s\n' "$digest" "$archive" | sha256sum -c -
+        else
+          printf '%s  %s\n' "$digest" "$archive" | shasum -a 256 -c -
+        fi
+        case "$archive" in
+          *.zip) unzip -oq "$archive" ;;
+          *) tar -xzf "$archive" ;;
+        esac
+        bin=$(find "$target" -type d -name bin -print -quit)
+        test -n "$bin"
+        # Print the installed build so the log records the exact version that ran.
+        "$bin/nsh" --version 2>/dev/null || "$bin/nsh.exe" --version 2>/dev/null || true
+        if [[ "$RUNNER_PLATFORM" == Windows ]]; then bin=$(cygpath -w "$bin"); fi
+        echo "$bin" >> "$GITHUB_PATH"

@@ -1,0 +1,26 @@
+version: 1
+
+project:
+  root: .
+  build_config: lzc-build.yml
+  package_file: package.yml
+  output: dist/eta.lpk
+  target_arch: amd64
+
+# 上游不发容器镜像（lzc-build.yml 内嵌源码构建），无 registry 跟踪对象：
+# 版本走 git 来源，升级时更新 upstream/eta 指向的 tag 并 bump package.yml.version
+update:
+  strategy: publish
+  allow_downgrade: false
+  version_source:
+    type: git
+
+images: []
+
+stores:
+  private:
+    enabled: true
+    skip_if_version_exists: false
+    name: "eta"
+  official:
+    enabled: false

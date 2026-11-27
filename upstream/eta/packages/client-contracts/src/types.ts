@@ -1,0 +1,361 @@
+import type {
+  ContextReading,
+  GenerationRate,
+  MemberSpend,
+} from "./context-usage";
+import type {
+  AgentMessage,
+  AskPayload,
+  GoalState,
+  StoredTask,
+  ThinkingLevel,
+  Usage,
+} from "./data";
+import type { ProviderKind } from "./providers";
+/**
+ * The shapes a client draws with. These are *data contracts*, not the pipe: the protocol
+ * itself (calls, state, events) is in `@eta/client-wire-proto` and knows nothing about sessions, git or
+ * plugins. A section the server never sends is simply a section the client never sees.
+ */
+
+/** A plugin's front-end, as data. The server never renders and never runs client code. */
+export interface PluginPanelDescriptor {
+  name: string;
+  title: string;
+  slot: PluginSlot;
+  /** Where the sandbox loads from, when the plugin has a front-end at all. */
+  entry?: string | undefined;
+  /** The state target that feeds this panel: the client subscribes to what it draws. */
+  state?: string | undefined;
+  multiple?: boolean | undefined;
+}
+
+export type PluginSlot = "sidebar" | "panel" | "overlay" | "statusbar";
+
+/** A plugin the server has, as `hello` reports it. */
+export interface MountedPlugin {
+  name: string;
+  version?: string | undefined;
+  /** How it was loaded: shipped with the server, or scanned from the user's directories. */
+  source: "bundled" | "user";
+  descriptor?: PluginPanelDescriptor | undefined;
+  /** Set when the plugin failed to load: the pipe is fine, this plugin is not. */
+  error?: string | undefined;
+}
+
+/** What the prompt layer reports about the blocks it composed. */
+export interface ViewDiagnostics {
+  stableChars: number;
+  adaptiveChars: number;
+  sections: { name: string; stable: boolean; text: string }[];
+}
+
+// ------------------------------------------------------------------- session sections
+
+/** The session's own slice: who it is, and whether something is happening right now. */
+export interface ViewCore {
+  session: string;
+  cwd?: string | undefined;
+  running: boolean;
+  /** The in-flight assistant message while a run streams; absent once committed. */
+  streaming?: AgentMessage | undefined;
+}
+
+export interface ViewMessageRow {
+  entryId: string;
+  seq: number;
+  at: number;
+  message: AgentMessage;
+}
+
+export interface SessionViewMessageRow extends ViewMessageRow {}
+
+/**
+ * A system row: something the session did that is not a message (goal, ask, btw, a failed
+ * run…). A `run_failed` row carries `args.runId` and `args.error`; it is a record for the
+ * reader, never part of what the model is sent.
+ */
+export interface SessionViewSystemRow {
+  entryId: string;
+  seq: number;
+  /** When the entry was recorded; absent from servers that predate it. */
+  at?: number | undefined;
+  kind: string;
+  args: Record<string, string>;
+}
+
+/** `sessions.history`'s answer: one page of messages and the system rows among them. */
+export interface SessionHistoryResult {
+  session: string;
+  rows: ViewMessageRow[];
+  /** System rows in the page's span (a failed run…); absent from servers that predate it. */
+  systems?: SessionViewSystemRow[] | undefined;
+}
+
+/** `sessions.image`'s answer: the picture a view or history page left out. */
+export interface SessionImage {
+  mimeType: string;
+  data: string;
+}
+
+export interface TranscriptSection {
+  messages: ViewMessageRow[];
+  /** Messages older than this window exist in the journal; set once paging starts. */
+  messagesBefore?: number | undefined;
+}
+
+export interface SessionViewQueuedItem {
+  entryId: string;
+  kind: string;
+  text: string;
+  /** Attachments ride as attachments: a pull-back restores chips, not base64 text. */
+  images?: { mime: string; dataBase64: string }[] | undefined;
+}
+
+/** One btw thread as the panel sees it. */
+export interface SessionViewBtwThread {
+  id: string;
+  kind: "contextual" | "tangent";
+  exchanges: {
+    question: string;
+    answer: string;
+    at: number;
+    steps?: { tool: string; ok: boolean; at: number }[];
+  }[];
+  saveState: "not-saved" | "queued" | "saved";
+  pending?: { question: string; at: number };
+  error?: string;
+}
+
+export interface SessionViewSubagent {
+  id: string;
+  status: "queued" | "running" | "done" | "failed" | "stopped";
+  turns: number;
+}
+
+/**
+ * The sections a session's state is *known* to have today.
+ *
+ * This is a lookup table for reading, never the container's type: a plugin contributes
+ * `git`, `ssh`, whatever it owns, and neither the protocol nor the server learns its name.
+ */
+export interface SessionViewSections {
+  core: ViewCore;
+  transcript: TranscriptSection;
+  systems: { rows: SessionViewSystemRow[] };
+  thinking: { rows: string[] };
+  branch: { tipId: string | null; compactionEpoch: number };
+  usage: Usage;
+  context: ContextReading;
+  spend: MemberSpend;
+  rate: GenerationRate | null;
+  goal: GoalState | undefined;
+  tasks: StoredTask[];
+  sideThread: SessionViewBtwThread[];
+  subagents: SessionViewSubagent[];
+  personas: string[];
+  model: {
+    id: string;
+    /** The level the session runs on: what the model takes of the one asked for, else `off`. */
+    thinkingLevel: ThinkingLevel;
+    /**
+     * The level the session was asked for (the agent's), `null` for none. It differs from
+     * `thinkingLevel` when the model does not take it and the session runs on the model's
+     * default. Absent from older hosts.
+     */
+    thinkingAsked?: ThinkingLevel | null | undefined;
+  };
+  queue: { items: SessionViewQueuedItem[] };
+  tools: { name: string; description: string }[];
+  metrics: { tokensPerSec: number };
+  prompt: ViewDiagnostics | undefined;
+  memory: { chars: number };
+  state: { keys: string[] };
+  ask: { pending?: AskPayload | undefined; deadline?: number | undefined };
+  [name: string]: unknown;
+}
+
+export type SectionName = keyof SessionViewSections & string;
+
+/** One session's state, as the client keeps it: sections plus their revisions. */
+export interface SessionState {
+  sections: Record<string, unknown>;
+  revisions: Record<string, string>;
+}
+
+/** A row of the session list (the `sessions` target's state). */
+export interface SidebarSession {
+  id: string;
+  title?: string | undefined;
+  pinned?: boolean | undefined;
+  archived?: boolean | undefined;
+  cwd?: string | undefined;
+  createdAt?: number | undefined;
+  updated?: number | undefined;
+  badges: string[];
+  personas: string[];
+  /** Why this session cannot be read, when it cannot (the store keeps the row). */
+  broken?: string | undefined;
+  /** The machine it runs on, when that is not the one serving the list. */
+  machine?: string | undefined;
+}
+
+/* ------------------------------------------------------------------ providers */
+
+/**
+ * Extra request headers for one provider. A `null` value means "do not send this header", which
+ * also suppresses one the transport would add by itself (User-Agent, Authorization).
+ */
+export type ProviderHeaders = Record<string, string | null>;
+
+/** What a model can do. Missing metadata is unknown, not a negative claim. */
+export interface ModelCapabilities {
+  name?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  input?: ("text" | "image")[];
+  reasoning?: boolean;
+  thinkingMode?: "only" | "both" | "no";
+  reasoningEfforts?: (
+    | "minimal"
+    | "low"
+    | "medium"
+    | "high"
+    | "xhigh"
+    | "max"
+  )[];
+  providerDefaultEffort?:
+    | "minimal"
+    | "low"
+    | "medium"
+    | "high"
+    | "xhigh"
+    | "max";
+}
+
+/**
+ * The wire protocol one model is served over, when its provider mixes them (OpenCode serves some
+ * models over Chat Completions and others over Responses from the same endpoint). Absent means
+ * the provider kind's own protocol.
+ */
+export type ModelApi = "openai-completions" | "openai-responses";
+
+export interface EtaModelConfig extends ModelCapabilities {
+  id: string;
+  api?: ModelApi;
+  /** The provider's catalog still lists it, as deprecated: kept, but not added by a refresh. */
+  deprecated?: boolean;
+  /** The provider's catalog no longer lists it; a refresh keeps it so nothing fails silently. */
+  delisted?: boolean;
+  defaultThinking?:
+    | "off"
+    | "minimal"
+    | "low"
+    | "medium"
+    | "high"
+    | "xhigh"
+    | "max";
+  overrides?: ModelCapabilities;
+}
+
+/**
+ * A model the provider's catalog lists but eta cannot use yet: its protocol (Anthropic Messages,
+ * Gemini, Mistral) or its endpoint is not one this provider speaks. Shown, never silently dropped.
+ */
+export interface UnsupportedModel {
+  id: string;
+  name?: string;
+  /** The catalog's own name for the protocol, e.g. `@ai-sdk/anthropic`. */
+  protocol: string;
+  reason: "protocol" | "endpoint" | "invalid";
+}
+
+/** One provider as a client sees it: the key is a boolean, never the secret. */
+export interface ProviderSummary {
+  id: string;
+  name?: string;
+  kind: ProviderKind;
+  baseUrl: string;
+  hasApiKey: boolean;
+  /** Opaque generation of the bound account and its credentials, when balance reads are supported. */
+  balanceRevision?: string;
+  headers?: ProviderHeaders;
+  models: EtaModelConfig[];
+  lastRefreshedAt?: string;
+}
+
+/**
+ * The last time a provider was checked: its model list is the probe. `invalid_key` is the
+ * provider refusing the key (HTTP 401 or 403); `unreachable` is every other failure, with the
+ * discovery code in `error`. A provider never checked since the host started has none.
+ */
+export interface ProviderCheck {
+  state: "ok" | "invalid_key" | "unreachable";
+  checkedAt: string;
+  error?: string;
+}
+
+export interface NetworkConfig {
+  mode: "system" | "manual" | "direct";
+  proxyUrl?: string;
+  noProxy?: string;
+}
+
+/** Why an entry of the private-network list has no effect (`@searxng-js/sex-egress`'s reasons). */
+export type PrivateNetworkEntryReason =
+  | "syntax"
+  | "url"
+  | "port"
+  | "prefix"
+  | "never"
+  | "loopback";
+
+/**
+ * Which private addresses `web_fetch` may reach (`web.privateNetwork` in `config.json`): networks
+ * and host names, each with an optional port, plus loopback behind its own switch. Link-local and
+ * cloud metadata addresses are never reachable, whatever the list says.
+ */
+export interface PrivateNetworkConfig {
+  /** The entries as written, the invalid ones included (they have no effect). */
+  allow: string[];
+  /** Local services on the host (`localhost`, `127.0.0.0/8`, `::1`). */
+  loopback: boolean;
+  /** The entries that have no effect, and why. */
+  invalid: { entry: string; reason: PrivateNetworkEntryReason }[];
+}
+
+/** The providers target's state: what a settings page renders, and the revision it holds. */
+export interface ProvidersView {
+  network?: NetworkConfig;
+  /** Absent when the config has no `web.privateNetwork`: no private address is reachable. */
+  privateNetwork?: PrivateNetworkConfig;
+  providers: ProviderSummary[];
+  /** The config file's content hash: a write carries the revision it read. */
+  revision: string;
+}
+
+/* ------------------------------------------------------------------ service discovery */
+
+/** Bumped when a client and a running backend can no longer understand each other. */
+export const SERVICE_PROTOCOL = 1;
+
+/**
+ * What a running backend says about itself in its run file (`eta-server --run-file <path>`), so a
+ * shell can find it instead of starting a second one. Public facts only: no credential is in here,
+ * and the file is 0600 in the user's own directory.
+ *
+ * `state: "starting"` is the claim a server writes before it listens — it says "this pid is
+ * becoming the backend, wait for it" — and `"ready"` replaces it once the port is open.
+ */
+export type ServiceDescriptor =
+  | { state: "starting"; pid: number; startedAt: number }
+  | {
+      state: "ready";
+      protocol: number;
+      pid: number;
+      host: string;
+      port: number;
+      dataDir: string;
+      version: string;
+      startedAt: number;
+    };

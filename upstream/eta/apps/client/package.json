@@ -1,0 +1,31 @@
+{
+  "name": "@eta/client",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun ../../scripts/nsh-client.ts run App.tsx --target web",
+    "dev:native": "bun ../../scripts/nsh-client.ts run App.tsx",
+    "package:web": "bun ../../scripts/nsh-client.ts package App.tsx --target web --out dist",
+    "client:check": "bun ../../scripts/nsh-client.ts check",
+    "client:test": "bun ../../scripts/nsh-client.ts test",
+    "typecheck": "bun run client:check",
+    "test": "bun run client:test",
+    "lint": "ast-grep test --skip-snapshot-tests && bun scripts/check-design-values.ts",
+    "templates": "bun scripts/agent-templates.ts",
+    "package": "bun ../../scripts/nsh-client.ts package App.tsx",
+    "publish:ios": "bun ../../scripts/nsh-client.ts publish ios",
+    "publish:android": "bun ../../scripts/nsh-client.ts publish android"
+  },
+  "dependencies": {
+    "@botiverse/oar": "0.136.0",
+    "@eta/client-contracts": "*",
+    "blobatar": "2.7.0",
+    "es-module-lexer": "2.3.2",
+    "html2canvas-pro": "2.6.4",
+    "jsqr": "^1.4.0",
+    "qrcode-generator": "^2.0.4"
+  },
+  "devDependencies": {
+    "@ast-grep/cli": "0.51.3"
+  }
+}

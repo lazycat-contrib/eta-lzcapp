@@ -1,0 +1,154 @@
+/**
+ * External agent runtimes, as the session host sees them.
+ *
+ * A session runs on eta's own loop unless its metadata names a `runtime` (Claude Code, Codex,
+ * ...). Then the manager asks the host's runtimes for that one, and the session's runs are
+ * delegated to it (`RunDelegate` in the kernel): the session stays an eta session, with its
+ * journal, its bus, its inbox and its place in every list, and the runtime is what answers.
+ *
+ * The manager does not know what a runtime is or how it is reached; it knows the shape below. A
+ * host that supplies none simply cannot open such a session, and says so.
+ */
+import type {
+  AgentRuntimeAccount,
+  AgentRuntimeInfo,
+  RuntimeCompaction,
+  SessionMcpServer,
+} from "@eta/client-contracts";
+import type { KernelConfig, KernelModels, RunDelegate } from "@eta/core";
+
+export type { RuntimeCompaction };
+
+export interface SessionRuntimeInput {
+  /** The eta session whose runs this takes. */
+  sessionId: string;
+  /** Which runtime (`claude`, `codex`, ...). */
+  runtime: string;
+  /** The project the session works in. */
+  cwd: string;
+  /** The runtime's own session to pick up, when this one has run before. */
+  resume?: string | undefined;
+  /**
+   * Who the agent is, what it was told and what the app around it is: what stands in for an eta
+   * session's platform section. Read when the runtime opens, after the session's tools exist,
+   * because what it says about the board depends on them.
+   */
+  agentPrompt: () => string | undefined;
+  /** The runtime opened a session of its own: remember it, so the next open picks it up. */
+  remember: (nativeSession: string) => void | Promise<void>;
+  /**
+   * The tools the host gave this session, by name: what the runtime is offered beyond its own
+   * (a task board, a way to reach other agents). Read when the runtime opens, after they exist.
+   */
+  hostTools: () => readonly string[];
+  /** MCP servers the runtime starts for this session itself: what its agent's plugins bring. */
+  mcpServers?: readonly SessionMcpServer[] | undefined;
+  /** Arguments for the runtime's process; a runtime's own way of being told something. */
+  launchArgs?: readonly string[] | undefined;
+  /**
+   * The runtime began a turn nobody asked for (Claude Code answering a background task's
+   * notification): start a run for it, now or once the run in flight has ended. The run's
+   * opening is whatever the inbox holds, which may be nothing; the delegate follows the turn.
+   * `wanted` is asked again before a deferred start: a run that began meanwhile may have taken
+   * the turn already.
+   */
+  wake?: ((wanted: () => boolean) => void) | undefined;
+}
+
+/** What a session on an external runtime gets from the host beyond its tools. */
+export interface RuntimeExtras {
+  /** The skills it can read, as a block of its system prompt; empty when it has none. */
+  skills?: string | undefined;
+  mcpServers?: readonly SessionMcpServer[] | undefined;
+  launchArgs?: readonly string[] | undefined;
+}
+
+export interface SessionRuntime {
+  /**
+   * What the session's model resolves against: the runtime's own models, as
+   * `runtime:modelId`. Only `getModel` is asked; the runtime generates, not eta.
+   */
+  models: KernelModels;
+  delegate: RunDelegate;
+  /**
+   * Compact the runtime's context now, in the runtime's own way (`/compact`). `config` is what
+   * the session is on, for a runtime that has to be opened first. A session's context is the
+   * runtime's, so this is the one way to it: eta's compaction is not installed on such a session.
+   */
+  compact?: (config: KernelConfig) => Promise<RuntimeCompaction>;
+  /** Let the runtime go: its process, and anything it served for the session. */
+  dispose: () => Promise<void>;
+  /**
+   * Whether the runtime has a process up for this session, and when the session last did anything
+   * (a run, a compaction, something the runtime said). What an idle sweep reads.
+   */
+  residency?: () => RuntimeResidency;
+  /**
+   * Let the runtime's process go while the session is idle, keeping the conversation: the next run
+   * resumes it, as after a restart. Answers `false`, and keeps the process, while anything is under
+   * way (a run, a compaction, a background task) or where the runtime could not pick the
+   * conversation up again. Unlike `dispose`, the session stays usable.
+   */
+  release?: () => Promise<boolean>;
+}
+
+export interface RuntimeResidency {
+  resident: boolean;
+  /** Epoch milliseconds. */
+  lastActive: number;
+}
+
+export interface SessionRuntimes {
+  /** The runtime for one session; `undefined` when this host does not run that one. */
+  open: (input: SessionRuntimeInput) => SessionRuntime | undefined;
+}
+
+/** Which runtimes a set has on this machine, and their models: what a settings screen reads. */
+export interface RuntimeListing {
+  list: (fresh?: boolean) => Promise<AgentRuntimeInfo[]>;
+  /** A runtime's sign-in and plan usage; undefined when the runtime is not this set's. */
+  account?: (runtime: string) => Promise<AgentRuntimeAccount | undefined>;
+}
+
+/** Runtimes that can also say what they are: what a host and a daemon are given. */
+export interface ListedRuntimes extends SessionRuntimes {
+  readonly catalog: RuntimeListing;
+}
+
+/**
+ * Several sets of runtimes as one. A session's runtime is asked of each in turn, and the first
+ * that answers takes it (`open` already answers `undefined` for "not mine"); the catalog is every
+ * set's, one after another. A set whose listing fails is left out of the answer rather than
+ * failing the others.
+ */
+export function composeRuntimes(
+  parts: readonly (SessionRuntimes & { catalog?: RuntimeListing })[],
+): ListedRuntimes {
+  return {
+    open: (input) => {
+      for (const part of parts) {
+        const runtime = part.open(input);
+        if (runtime !== undefined) return runtime;
+      }
+      return undefined;
+    },
+    catalog: {
+      list: async (fresh = false) =>
+        (
+          await Promise.all(
+            parts.map(
+              async (part) =>
+                (await part.catalog?.list(fresh).catch(() => [])) ?? [],
+            ),
+          )
+        ).flat(),
+      account: async (runtime) => {
+        for (const part of parts) {
+          const account = await part.catalog?.account?.(runtime);
+          if (account !== undefined) return account;
+        }
+        return undefined;
+      },
+    },
+  };
+}

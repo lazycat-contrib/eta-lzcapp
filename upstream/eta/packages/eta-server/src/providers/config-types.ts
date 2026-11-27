@@ -1,0 +1,205 @@
+/**
+ * What a provider *is*, as data: kinds, presets, the capabilities a model declares, and the
+ * header rules. Ported from eta-agent's `core/provider-config.ts`, which lived in core there
+ * because the client also rendered it; here the client gets the view types over the wire and
+ * this file stays server-side logic.
+ *
+ * The reason this is a separate file from the config store: none of it touches the filesystem.
+ * It is the vocabulary (what a kind means, what a model can do) and the rules that make a
+ * hand-edited config file safe to read — both worth testing without a file at all.
+ */
+
+import type {
+  ModelApi,
+  ProviderHeaders,
+  ProviderKind,
+  ProviderSummary,
+} from "@eta/client-contracts";
+import type { ThinkingLevel } from "@eta/core";
+
+import { createHmac, randomBytes } from "node:crypto";
+
+const balanceSalt = randomBytes(32);
+/** Opaque to clients, local to this Host instance, stable across model-list edits. */
+export function balanceRevision(provider: EtaProviderConfig): string {
+  return createHmac("sha256", balanceSalt)
+    .update(
+      JSON.stringify([
+        provider.id,
+        provider.kind,
+        provider.baseUrl,
+        provider.apiKey,
+        provider.headers,
+      ]),
+    )
+    .digest("hex");
+}
+
+export const MODEL_THINKING_LEVELS = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const satisfies readonly ThinkingLevel[];
+
+/** The effort levels a configured model can name: eta's own models never take `ultra`. */
+type ModelEffort = Exclude<(typeof MODEL_THINKING_LEVELS)[number], "off">;
+
+export type ModelInput = "text" | "image";
+
+/** Provider-owned capabilities. Missing metadata is unknown, not a negative claim. */
+export interface ModelCapabilities {
+  name?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  input?: ModelInput[];
+  reasoning?: boolean;
+  thinkingMode?: "only" | "both" | "no";
+  reasoningEfforts?: ModelEffort[];
+  providerDefaultEffort?: ModelEffort;
+}
+
+/** A model as the config file holds it: capabilities plus the user's own choices. */
+export interface EtaModelConfig extends ModelCapabilities {
+  id: string;
+  /** The protocol this model is served over; absent means the provider kind's own. */
+  api?: ModelApi;
+  /** Listed by the provider's catalog as deprecated. */
+  deprecated?: boolean;
+  /** No longer listed by the provider's catalog: kept so an agent using it hears about it. */
+  delisted?: boolean;
+  /** User preference; omission follows the provider default. */
+  defaultThinking?: (typeof MODEL_THINKING_LEVELS)[number];
+  /** Manual corrections for custom endpoints, kept across discovery refreshes. */
+  overrides?: ModelCapabilities;
+}
+
+/** One provider as the config file holds it. `apiKey` never leaves the server. */
+export interface EtaProviderConfig {
+  id: string;
+  name?: string;
+  kind?: ProviderKind;
+  baseUrl: string;
+  apiKey?: string;
+  headers?: ProviderHeaders;
+  models: EtaModelConfig[];
+  lastRefreshedAt?: string;
+}
+
+export interface EtaConfig {
+  network?: {
+    mode: "system" | "manual" | "direct";
+    proxyUrl?: string;
+    noProxy?: string;
+  };
+  providers?: EtaProviderConfig[];
+  /** What the host's own web tools may reach. Hand-edited, so every field is checked on read. */
+  web?: {
+    privateNetwork?: { allow?: unknown; loopback?: unknown };
+  };
+}
+
+/** RFC 7230 token: the only names worth accepting from a settings form. */
+export const HEADER_NAME_PATTERN = /^[!#$%&'*+.^\w`|~-]+$/;
+export const MAX_PROVIDER_HEADERS = 32;
+export const MAX_HEADER_NAME_LENGTH = 128;
+export const MAX_HEADER_VALUE_LENGTH = 8192;
+
+/**
+ * Read-path sanitising for a config file that may have been hand-edited: unusable entries are
+ * dropped instead of throwing (a typo in one header must not make the whole config unreadable).
+ * Names collapse case-insensitively, last occurrence wins.
+ */
+export function sanitizeProviderHeaders(
+  value: unknown,
+): ProviderHeaders | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return undefined;
+  const entries: [string, string | null][] = [];
+  for (const [rawName, raw] of Object.entries(value)) {
+    if (entries.length >= MAX_PROVIDER_HEADERS) break;
+    const name = rawName.trim();
+    if (!HEADER_NAME_PATTERN.test(name) || name.length > MAX_HEADER_NAME_LENGTH)
+      continue;
+    if (
+      raw !== null &&
+      (typeof raw !== "string" ||
+        raw.length > MAX_HEADER_VALUE_LENGTH ||
+        /[\r\n]/.test(raw))
+    ) {
+      continue;
+    }
+    const header = raw === null || raw.trim().length === 0 ? null : raw.trim();
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      if (entries[index]?.[0].toLowerCase() === name.toLowerCase())
+        entries.splice(index, 1);
+    }
+    entries.push([name, header]);
+  }
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+/** Provider overrides applied over transport defaults, case-insensitively; `null` removes a header. */
+export function applyProviderHeaders(
+  base: Record<string, string>,
+  headers?: ProviderHeaders,
+): Record<string, string> {
+  const out: Record<string, string> = { ...base };
+  for (const [rawName, value] of Object.entries(headers ?? {})) {
+    const name = rawName.trim();
+    if (!HEADER_NAME_PATTERN.test(name)) continue;
+    for (const existing of Object.keys(out)) {
+      if (existing.toLowerCase() === name.toLowerCase()) delete out[existing];
+    }
+    if (value !== null) out[name] = value;
+  }
+  return out;
+}
+
+export function effectiveModel(model: EtaModelConfig): EtaModelConfig {
+  return { ...model, ...model.overrides };
+}
+
+/**
+ * The thinking levels a model declares.
+ *
+ * Two honest answers that look like the same thing: `["off"]` for a model that says it does not
+ * reason (an off switch is the only thing left), and `[]` for a model that says nothing at all —
+ * "unknown" is not "none", and a model whose provider always thinks must not acquire an invented
+ * off switch.
+ */
+export function modelThinkingLevels(input: EtaModelConfig): ThinkingLevel[] {
+  const model = effectiveModel(input);
+  if (model.thinkingMode === "no" || model.reasoning === false) return ["off"];
+  if (model.reasoning === undefined) return [];
+  const efforts = model.reasoningEfforts ?? [];
+  if (efforts.length === 0) return [];
+  const off = model.thinkingMode === "both";
+  return [...(off ? (["off"] as const) : []), ...efforts];
+}
+
+/** One provider, as a client sees it: the key becomes `hasApiKey`, the headers stay. */
+export function providerSummary(provider: EtaProviderConfig): ProviderSummary {
+  const headers = sanitizeProviderHeaders(provider.headers);
+  return {
+    id: provider.id,
+    ...(provider.name === undefined ? {} : { name: provider.name }),
+    kind: provider.kind ?? "openai-compatible",
+    ...(provider.kind === "deepseek" ||
+    provider.kind === "moonshot-cn" ||
+    provider.kind === "moonshot-global"
+      ? { balanceRevision: balanceRevision(provider) }
+      : {}),
+    baseUrl: provider.baseUrl,
+    hasApiKey:
+      typeof provider.apiKey === "string" && provider.apiKey.length > 0,
+    ...(headers === undefined ? {} : { headers }),
+    models: provider.models.map(effectiveModel),
+    ...(provider.lastRefreshedAt === undefined
+      ? {}
+      : { lastRefreshedAt: provider.lastRefreshedAt }),
+  };
+}
